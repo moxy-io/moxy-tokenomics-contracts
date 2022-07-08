@@ -1,11 +1,12 @@
 import FungibleToken from "./flow/FungibleToken.cdc"
-//import FungibleToken from 0xee82856bf20e2aa6
+import LockedToken from "./LockedToken.cdc"
+import MoxyData from "./MoxyData.cdc"
+
 pub contract MoxyVaultToken: FungibleToken {
 
     /// Total supply of ExampleTokens in existence
     pub var totalSupply: UFix64
-    access(contract) var totalSupplies: {UFix64:UFix64}
-    access(contract) var totalSupplyTimestampMap: [UFix64]
+    access(contract) var totalSupplies: @MoxyData.OrderedDictionary
 
     /// TokensInitialized
     ///
@@ -42,6 +43,8 @@ pub contract MoxyVaultToken: FungibleToken {
     /// The event that is emitted when a new burner resource is created
     pub event BurnerCreated()
 
+    pub event MVToMOXYConverterCreated(conversionAmount: UFix64, timestamp: UFix64)
+
     /// Vault
     ///
     /// Each user stores an instance of only the Vault in their storage
@@ -58,118 +61,44 @@ pub contract MoxyVaultToken: FungibleToken {
 
         /// The total balance of this vault
         pub var balance: UFix64
-        access(contract) var dailyBalances: {UFix64:UFix64}
-        access(contract) var timestampMap: [UFix64]
+        access(contract) var dailyBalances: @MoxyData.OrderedDictionary
+        
+//        access(contract) var dailyBalances: {UFix64:UFix64}
+//        access(contract) var timestampMap: [UFix64]
+
 
         // initialize the balance at resource creation time
         init(balance: UFix64) {
             self.balance = balance
-            self.dailyBalances = {}
-            self.timestampMap = []
+            self.dailyBalances <- MoxyData.createNewOrderedDictionary()
+        }
+
+        pub fun getDailyBalances(): {UFix64: UFix64} {
+            return self.dailyBalances.getDictionary()
         }
 
         pub fun getDailyBalanceFor(timestamp: UFix64): UFix64? {
-            let time0000 = MoxyVaultToken.getTimestampTo0000(timestamp: timestamp)
-            if (self.dailyBalances[time0000] == nil) {
-                // For this day there are no registered balances, search for the
-                // last recorded balance or zero if there are no previous records
-                // per requested day
-                var index = -1
-                var hasActivity = false
-                for time in self.timestampMap {
-                    if (time >= time0000  ) {
-                        hasActivity = true
-                        break
-                    }
-                    index = index + 1
-                }
-                if (index < 0) {
-                    // There is no previous activity
-                    return 0.0
-                }
-                return self.dailyBalances[self.timestampMap[index]]
-            }
-            return self.dailyBalances[time0000]
+            return self.dailyBalances.getValueOrMostRecentFor(timestamp: timestamp)
         }
 
         pub fun getDailyBalanceForToday(): UFix64? {
-            return self.getDailyBalanceFor(timestamp: getCurrentBlock().timestamp)
+            return self.dailyBalances.getValueForToday()
         }
 
         pub fun getDailyBalancesChanges(): {UFix64:UFix64} {
-            let resu: {UFix64:UFix64} = {}
-            var timeBefore = 0.0
-            for time in self.timestampMap {
-                resu[time] = self.dailyBalances[time]! - timeBefore
-                timeBefore = self.dailyBalances[time]!
-            }
-
-            return resu
+            return self.dailyBalances.getValueChanges()
         }
 
-
         pub fun getDailyBalanceChange(timestamp: UFix64): UFix64 {
-            let time0000 = MoxyVaultToken.getTimestampTo0000(timestamp: timestamp)
-
-            if (self.timestampMap.length < 1) {
-                // No records => no change
-                return 0.0
-            }
-            if (self.timestampMap[0] > time0000 ) {
-                // We query for a timestamp prior to the first one registered
-                return 0.0
-            }
-            var lastTimestamp = self.getLastTimestampAdded()
-            if (time0000 > lastTimestamp!) {
-                // Check a date after the last one registered
-                return 0.0
-            }
-
-            // Balance on date
-            var tokenTimestamp = self.dailyBalances[time0000]
-            
-            if (tokenTimestamp == nil) {
-                // The date has no records => no changes
-                return 0.0
-            }
-
-            // We look for the last balance prior to the date
-            if (self.timestampMap[0] == time0000 ) {
-                // There is no previous, the change is the balance total
-                return tokenTimestamp!
-            }
-
-            // There is a balance, we have to look for the previous balance to see
-            // what was the change
-
-            var index = 0
-            for time in self.timestampMap {
-                if (time == time0000) {
-                    break
-                }
-                index = index + 1
-            }
-            let indexBefore = index - 1
-            var tokenBefore = self.dailyBalances[self.timestampMap[indexBefore]]
-
-            return tokenTimestamp! - tokenBefore!
+            return self.dailyBalances.getValueChange(timestamp: timestamp)
         }
 
         pub fun getLastTimestampAdded(): UFix64? {
-            let pos = self.timestampMap.length - 1
-            if (pos < 0) {
-                return nil
-            }
-            return self.timestampMap[pos]
+            return self.dailyBalances.getLastKeyAdded()
         }
 
         pub fun getFirstTimestampAdded(): UFix64? {
-            return self.timestampMap[0]
-        }
-
-        pub fun getTimestampToStart(timestamp: UFix64): UFix64 {
-            let days = timestamp / 86400.0
-            return UFix64(UInt64(days)) * 86400.0
+            return self.dailyBalances.getFirstKeyAdded()
         }
 
         /// withdraw
@@ -183,8 +112,13 @@ pub contract MoxyVaultToken: FungibleToken {
         /// elsewhere.
         ///
         pub fun withdraw(amount: UFix64): @FungibleToken.Vault {
-            // Withdraw can't be done for MV token
-            panic("MV can't be withdrawn")
+            // Withdraw can only be done when a conversion MV to MOX is requested
+            // withdraw are done from oldest deposits to newer deposits
+
+            self.dailyBalances.withdrawValueFromOldest(amount: amount)
+            self.balance = self.balance - amount
+            emit TokensWithdrawn(amount: amount, from: self.owner?.address)
+            return <-create Vault(balance: amount)
         }
 
         /// deposit
@@ -203,14 +137,9 @@ pub contract MoxyVaultToken: FungibleToken {
 
         pub fun depositFor(from: @FungibleToken.Vault, timestamp: UFix64) {
             let vault <- from as! @MoxyVaultToken.Vault
-            let time0000 = MoxyVaultToken.getTimestampTo0000(timestamp: timestamp)
-            let lastTimestamp = self.getLastTimestampAdded()
-            if (lastTimestamp == nil || time0000 > lastTimestamp!) {
-                // Add record to array
-                self.dailyBalances[time0000] = self.balance
-                self.timestampMap.append(time0000)
-            }
-            self.dailyBalances[time0000] = self.dailyBalances[time0000]! + vault.balance           
+
+            self.dailyBalances.setAmountFor(timestamp: timestamp, amount: vault.balance)
+
             self.balance = self.balance + vault.balance
 
             emit TokensDeposited(amount: vault.balance, to: self.owner?.address)
@@ -219,8 +148,12 @@ pub contract MoxyVaultToken: FungibleToken {
             destroy vault       
         }
 
-
+        pub fun createNewMVConverter(privateVaultRef: Capability<&FungibleToken.Vault>, allowedAmount: UFix64): @MVConverter {
+            return <- create MVConverter(privateVaultRef: privateVaultRef, allowedAmount: allowedAmount)
+        }
+        
         destroy() {
+            MoxyVaultToken.destroyTotalSupply(orderedDictionary: <- self.dailyBalances) 
             MoxyVaultToken.totalSupply = MoxyVaultToken.totalSupply - self.balance
         }
     }
@@ -281,19 +214,13 @@ pub contract MoxyVaultToken: FungibleToken {
                 amount > 0.0: "Amount minted must be greater than zero"
                 amount <= self.allowedAmount: "Amount minted must be less than the allowed amount"
             }
-            let time0000 = MoxyVaultToken.getTimestampTo0000(timestamp: timestamp)
-            let lastTimestamp = MoxyVaultToken.getLastTotalSupplyTimestampAdded()
 
-            if (lastTimestamp != nil && time0000 < lastTimestamp!) {
-                panic("Cannot mint SCORE token for events before the last registerd")
+            if (!MoxyVaultToken.totalSupplies.canUpdateTo(timestamp: timestamp)) {
+                panic("Cannot mint MV token for events before the last registerd")
             } 
 
-            if (lastTimestamp == nil || time0000 > lastTimestamp!) {
-                MoxyVaultToken.totalSupplyTimestampMap.append(time0000)
-                MoxyVaultToken.totalSupplies[time0000] = MoxyVaultToken.totalSupply
-            }
+            MoxyVaultToken.totalSupplies.setAmountFor(timestamp: timestamp, amount: amount)
 
-            MoxyVaultToken.totalSupplies[time0000] = MoxyVaultToken.totalSupplies[time0000]! + amount
             MoxyVaultToken.totalSupply = MoxyVaultToken.totalSupply + amount
 
             self.allowedAmount = self.allowedAmount - amount
@@ -334,89 +261,41 @@ pub contract MoxyVaultToken: FungibleToken {
     }
 
     pub fun getLastTotalSupplyTimestampAdded(): UFix64? {
-        let pos = self.totalSupplyTimestampMap.length - 1
-        if (pos < 0) {
-            return nil
-        }
-        return self.totalSupplyTimestampMap[pos]
+        return self.totalSupplies.getLastKeyAdded()
     }
 
 
     pub fun getTotalSupplyFor(timestamp: UFix64): UFix64 {
-        let time0000 = self.getTimestampTo0000(timestamp: timestamp)
-    
-        if (MoxyVaultToken.totalSupplies[time0000] != nil) {
-            return MoxyVaultToken.totalSupplies[time0000]!
-        }
-
-        // Check if there is any registered score
-        if (MoxyVaultToken.totalSupplyTimestampMap.length < 1) {
-            // No score registered yet
-            return MoxyVaultToken.totalSupply
-        }
-
-        // Check if there is any registered score
-        if (MoxyVaultToken.totalSupplyTimestampMap.length < 2) {
-            // Only one record
-            if (MoxyVaultToken.totalSupplyTimestampMap[0] > time0000 ) {
-                // Returns zero because we are looking something prior to the first registered
-                return 0.0
-            }
-            return MoxyVaultToken.totalSupplies[MoxyVaultToken.totalSupplyTimestampMap[0]]!
-        }
-
-        // Check the first score before the time0000
-        var i = 0
-        for time in MoxyVaultToken.totalSupplyTimestampMap {
-            if (time > time0000) {
-                break
-            }
-            i = i + 1
-        }
-        i = i - 1
-
-        return MoxyVaultToken.totalSupplies[MoxyVaultToken.totalSupplyTimestampMap[i]]!
+        return self.totalSupplies.getValueOrMostRecentFor(timestamp: timestamp)
     }
 
     pub fun getDailyChangeTo(timestamp: UFix64): UFix64 {
-        let time0000 = self.getTimestampTo0000(timestamp: timestamp)
-        
-        var lastTimestamp = self.getLastTotalSupplyTimestampAdded()
-        var hasActivity = false
-        var i = -1
-        for time in MoxyVaultToken.totalSupplyTimestampMap {
-            if (time == time0000) {
-                hasActivity = true
-                break
-            }
-            i = i + 1
-        }
-
-        if (!hasActivity) {
-            // No activity found, this may be because the timestamp
-            // is at a time lower than the first record 
-            // or it is in the future, in which case the total supply is returned
-            if (lastTimestamp != nil && lastTimestamp! < time0000) {
-               return MoxyVaultToken.totalSupply 
-            }
-            return 0.0
-        }
-
-        if (MoxyVaultToken.totalSupplyTimestampMap.length < 1 || i < 0) {
-            return MoxyVaultToken.totalSupplies[time0000]!
-        }
-
-        let prevValue = MoxyVaultToken.totalSupplyTimestampMap[i]
-
-        let scoreTimestamp = MoxyVaultToken.totalSupplies[time0000]!
-        let scoreYesterday = MoxyVaultToken.totalSupplies[prevValue]!
-        
-        return scoreTimestamp - scoreYesterday
+        return self.totalSupplies.getValueChange(timestamp: timestamp)
     }
 
+    pub resource MVConverter: Converter {
+        pub var privateVaultRef: Capability<&FungibleToken.Vault>
+        pub var allowedAmount: UFix64
+
+        pub fun getDailyVault(amount: UFix64): @FungibleToken.Vault {
+            pre {
+                amount > 0.0: "Amount to burn must be greater than zero"
+                amount <= self.allowedAmount: "Amount to burn must be equal or less than the allowed amount. Allowed amount: ".concat(self.allowedAmount.toString()).concat(" amount: ").concat(amount.toString())
+            }
+            self.allowedAmount = self.allowedAmount - amount
+            let vault <- self.privateVaultRef.borrow()!.withdraw(amount: amount)
+            
+            return <-vault
+        }
+
+        init(privateVaultRef: Capability<&FungibleToken.Vault>, allowedAmount: UFix64 ) {
+            self.privateVaultRef = privateVaultRef
+            self.allowedAmount = allowedAmount
+        }
+    }
 
     pub resource interface DailyBalancesInterface {
-        access(contract) var dailyBalances: {UFix64:UFix64}
+        pub fun getDailyBalances(): {UFix64: UFix64}
         pub fun getDailyBalanceFor(timestamp: UFix64): UFix64? 
         pub fun getDailyBalanceForToday(): UFix64?
         pub fun getDailyBalanceChange(timestamp: UFix64): UFix64
@@ -429,30 +308,62 @@ pub contract MoxyVaultToken: FungibleToken {
         pub fun depositFor(from: @FungibleToken.Vault, timestamp: UFix64) 
     }
 
+    pub resource interface Converter {
+        pub fun getDailyVault(amount: UFix64): @FungibleToken.Vault
+    }
+
+    pub fun createEmptyLockedVault(): @LockedToken.LockedVault {
+        return <- LockedToken.createLockedVault(vault: <- self.createEmptyVault())
+    }
+
+    pub fun getTotalSupplies(): {UFix64: UFix64} {
+        return self.totalSupplies.getDictionary()
+    }
+
+    pub fun destroyTotalSupply(orderedDictionary: @MoxyData.OrderedDictionary) {
+        self.totalSupplies.destroyWith(orderedDictionary: <-orderedDictionary)
+    }
+
     pub let moxyVaultTokenVaultStorage: StoragePath
+    pub let moxyVaultTokenVaultPrivate: PrivatePath
     pub let moxyVaultTokenAdminStorage: StoragePath
     pub let moxyVaultTokenReceiverPath: PublicPath
     pub let moxyVaultTokenBalancePath: PublicPath
     pub let moxyVaultTokenDailyBalancePath: PublicPath
     pub let moxyVaultTokenReceiverTimestampPath: PublicPath
+    // Paths for Locked tonkens 
+    pub let moxyVaultTokenLockedVaultStorage: StoragePath
+    pub let moxyVaultTokenLockedVaultPrivate: PrivatePath
+    pub let moxyVaultTokenLockedBalancePath: PublicPath
+    pub let moxyVaultTokenLockedReceiverPath: PublicPath
 
     init() {
         self.totalSupply = 0.0
-        self.totalSupplies = {}
-        self.totalSupplyTimestampMap = []
+        self.totalSupplies <- MoxyData.createNewOrderedDictionary()
 
         self.moxyVaultTokenVaultStorage = /storage/moxyVaultTokenVault
+        self.moxyVaultTokenVaultPrivate = /private/moxyVaultTokenVault
         self.moxyVaultTokenAdminStorage = /storage/moxyVaultTokenAdmin
         self.moxyVaultTokenReceiverPath = /public/moxyVaultTokenReceiver
         self.moxyVaultTokenBalancePath = /public/moxyVaultTokenBalance
         self.moxyVaultTokenDailyBalancePath = /public/moxyVaultTokenDailyBalance
         self.moxyVaultTokenReceiverTimestampPath = /public/moxyVaultTokenReceiverTimestamp
-
+        // Locked vaults
+        self.moxyVaultTokenLockedVaultStorage = /storage/moxyVaultTokenLockedVault
+        self.moxyVaultTokenLockedVaultPrivate = /private/moxyVaultTokenLockedVault
+        self.moxyVaultTokenLockedBalancePath = /public/moxyVaultTokenLockedBalance
+        self.moxyVaultTokenLockedReceiverPath = /public/moxyVaultTokenLockedReceiver
 
         // Create the Vault with the total supply of tokens and save it in storage
         //
         let vault <- create Vault(balance: self.totalSupply)
         self.account.save(<-vault, to: self.moxyVaultTokenVaultStorage)
+
+        // Private access to MoxyVault token Vault
+        self.account.link<&MoxyVaultToken.Vault>(
+            self.moxyVaultTokenVaultPrivate,
+            target: self.moxyVaultTokenVaultStorage
+        )
 
         // Create a public capability to the stored Vault that only exposes
         // the `deposit` method through the `Receiver` interface
@@ -477,6 +388,25 @@ pub contract MoxyVaultToken: FungibleToken {
         self.account.link<&MoxyVaultToken.Vault{DailyBalancesInterface}>(
             self.moxyVaultTokenDailyBalancePath,
             target: self.moxyVaultTokenVaultStorage
+        )
+
+        // Create locked Vault and links
+        let lockedVault <- self.createEmptyLockedVault()
+        self.account.save(<-lockedVault, to: self.moxyVaultTokenLockedVaultStorage)
+
+        self.account.link<&LockedToken.LockedVault>(
+            self.moxyVaultTokenLockedVaultPrivate,
+            target: self.moxyVaultTokenLockedVaultStorage
+        )
+
+        self.account.link<&LockedToken.LockedVault{LockedToken.Balance}>(
+            self.moxyVaultTokenLockedBalancePath,
+            target: self.moxyVaultTokenLockedVaultStorage
+        )
+
+        self.account.link<&{LockedToken.Receiver}>(
+            self.moxyVaultTokenLockedReceiverPath,
+            target: self.moxyVaultTokenLockedVaultStorage
         )
 
         let admin <- create Administrator()

@@ -111,13 +111,13 @@ pub contract MoxyNFT: NonFungibleToken {
         // borrowNFT gets a reference to an NFT in the collection
         // so that the caller can read its metadata and call its methods
         pub fun borrowNFT(id: UInt64): &NonFungibleToken.NFT {
-            return &self.ownedNFTs[id] as &NonFungibleToken.NFT
+            return (&self.ownedNFTs[id] as &NonFungibleToken.NFT?)!
         }
  
         pub fun borrowMoxyNFT(id: UInt64): &MoxyNFT.NFT? {
             if self.ownedNFTs[id] != nil {
                 // Create an authorized reference to allow downcasting
-                let ref = &self.ownedNFTs[id] as auth &NonFungibleToken.NFT
+                let ref = (&self.ownedNFTs[id] as auth &NonFungibleToken.NFT?)!
                 return ref as! &MoxyNFT.NFT
             }
 
@@ -125,7 +125,7 @@ pub contract MoxyNFT: NonFungibleToken {
         }
 
         pub fun borrowViewResolver(id: UInt64): &AnyResource{MetadataViews.Resolver} {
-            let nft = &self.ownedNFTs[id] as auth &NonFungibleToken.NFT
+            let nft = (&self.ownedNFTs[id] as auth &NonFungibleToken.NFT?)!
             let MoxyNFT = nft as! &MoxyNFT.NFT
             return MoxyNFT as &AnyResource{MetadataViews.Resolver}
         }

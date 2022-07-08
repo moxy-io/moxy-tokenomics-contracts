@@ -1,10 +1,30 @@
 import FungibleToken from "./flow/FungibleToken.cdc"
+import LockedToken from "./LockedToken.cdc"
 import MoxyToken from "./MoxyToken.cdc"
+import MoxyVaultToken from "./MoxyVaultToken.cdc"
+import LinearRelease from "./LinearRelease.cdc"
+import MoxyProcessQueue from "./MoxyProcessQueue.cdc"
 
 pub contract MoxyReleaseRounds {
 
-    pub event AccountAdded(address: Address)
     pub event RoundAdded(name: String)
+
+    pub event AccountAddedToRound(round: String, address:Address, amount: UFix64)
+    pub event MOXYLockedTokensReleasedTo(round: String, address: Address, amount: UFix64)
+
+    // Unlock tokens events
+    pub event UnlockedMOXYTokenForLinearReleases(address: Address, amount: UFix64)
+    pub event UnlockedMVTokenForLinearReleases(address: Address, amount: UFix64)
+    
+    // Rounds user consent to participate on rounds releases
+    pub event AccountAlreadyAcceptedRoundParticipation(address: Address, timestamp: UFix64)
+    pub event AccountAcceptedRoundsParticipation(address: Address, timestamp: UFix64)
+
+    // Events for rounds allocation process
+    pub event StartingAllocationDailyReleaseRounds(timestamp: UFix64, accountsToProcess: Int)
+    pub event FinishingAllocationDailyReleaseRounds(timestamp: UFix64, accountsProcessed: Int)
+    pub event NoAmountToAllocateInRoundRelease(roundId: String, address: Address, timestamp: UFix64)
+    pub event RoundAllocationPerformed(roundId: String, address: Address, totalReleased: UFix64, timestamp: UFix64)
 
     pub struct ParticipantRoundInfo {
         pub let address: Address
@@ -20,17 +40,110 @@ pub contract MoxyReleaseRounds {
         }
     }
 
-    pub struct RoundRelease {
+    pub struct RoundInfo {
+        pub let id: String
+        pub let type: String
+        pub let name: String
+        pub let initialRelease: UFix64
+        pub let lockTime: Int 
+        pub let months: Int
+        pub let tgeDate: UFix64
+        pub let totalAllocated: UFix64
+        pub let totalReleased: UFix64
+        pub let unlockPercentageAtTGE: UFix64
+        pub let unlockPercentageAfterLockTime: UFix64
+        pub let isReleaseStarted: Bool
+        pub let allocateBeforeTGE: Bool
 
+        init(id: String, type: String, name: String, initialRelease: UFix64, 
+            lockTime: Int, months: Int, days: Int,
+            tgeDate: UFix64, totalAllocated: UFix64, totalReleased: UFix64,
+            unlockPercentageAtTGE: UFix64, unlockPercentageAfterLockTime: UFix64,
+            isReleaseStarted: Bool, allocateBeforeTGE: Bool) {
+                
+            self.id = id
+            self.type = type
+            self.name = name
+            self.initialRelease = initialRelease
+            self.lockTime = lockTime
+            self.months = months
+            self.tgeDate = tgeDate
+            self.totalAllocated = totalAllocated
+            self.totalReleased = totalReleased
+            self.unlockPercentageAtTGE = unlockPercentageAtTGE
+            self.unlockPercentageAfterLockTime = unlockPercentageAfterLockTime
+            self.isReleaseStarted = isReleaseStarted
+            self.allocateBeforeTGE = allocateBeforeTGE
+        }
+    }
+
+
+    pub struct RoundReleaseInfo {
         pub var amount: UFix64
+
+        // amountReleased is the total amount that is released in this round
         pub var amountReleased: UFix64
+
+        // date of the last release performed
+        pub var lastReleaseDate: UFix64
+
+        init(amount: UFix64, amountReleased: UFix64, lastReleaseDate: UFix64) {
+            self.amount = amount
+            self.amountReleased = amountReleased
+            self.lastReleaseDate = lastReleaseDate
+        }
+
+    }
+
+    pub resource RoundRelease {
+        // amount is the total amount that the user will receive in this round
+        pub var amount: UFix64
+
+        pub var linearReleases: @[LinearRelease.LinearSchedule]
+
+        // amountReleased is the total amount that is released in this round
+        pub var amountReleased: UFix64
+
+        // date of the last release performed
+        pub var lastReleaseDate: UFix64
+
+        pub var isAmountAtTGEPaid: Bool
+        pub var isAmountAfterLockPaid: Bool
+
+        pub fun getRoundReleaseInfo(): RoundReleaseInfo {
+
+            return RoundReleaseInfo(amount: self.amount, amountReleased: self.amountReleased, lastReleaseDate: self.lastReleaseDate)
+        }
 
         pub fun getAllocationRemaining(): UFix64 {
             return self.amount - self.amountReleased
         }
-        
-        pub fun payLinearRelease(amount: UFix64) {
-            self.amountReleased = self.amountReleased + amount
+
+        pub fun getTotalToAllocateNow(): UFix64 {
+            var total = 0.0
+            var i = 0
+            while (i < self.linearReleases.length) {
+                total = total + self.linearReleases[i].getTotalToUnlock()
+                i = i + 1
+            }
+            return total
+        }
+
+        pub fun payLinearReleases(): UFix64 {
+            var total = 0.0
+            var i = 0
+            while (i < self.linearReleases.length) {
+                total = total + self.linearReleases[i].getTotalToUnlock()
+                self.linearReleases[i].updateLastReleaseDate()
+                i = i + 1
+            }
+            self.amountReleased = self.amountReleased + total
+            self.lastReleaseDate = getCurrentBlock().timestamp
+            return total
+        }
+
+        pub fun addLinearRelease(linearRelease: @LinearRelease.LinearSchedule) {
+            self.linearReleases.append(<-linearRelease)
         }
 
         pub fun getAmount(): UFix64 {
@@ -40,44 +153,268 @@ pub contract MoxyReleaseRounds {
         pub fun increaseAmount(amount: UFix64) {
             self.amount = self.amount + amount
         }
-        
-        init( amount: UFix64) {
 
+        pub fun mergeWith(amount: UFix64, linearRelease: @LinearRelease.LinearSchedule) {
+            self.amount = self.amount + amount
+            self.addLinearRelease(linearRelease: <-linearRelease)
+        }
+
+        pub fun setStartDate(timestamp: UFix64) {
+            self.lastReleaseDate = timestamp
+            var i = 0
+            while (i < self.linearReleases.length) {
+                self.linearReleases[i].setStartDate(timestamp: timestamp)
+               i = i + 1
+            }
+
+        }
+
+        pub fun getAmountAtTGEToPay(): UFix64 {
+            var total = 0.0
+            var i = 0
+            while (i < self.linearReleases.length) {
+                total = total + self.linearReleases[i].getAmountAtTGEToPay()
+                i = i + 1
+            }
+            return total
+        }
+
+        pub fun getAmountAtTGE(): UFix64 {
+            var total = 0.0
+            var i = 0
+            while (i < self.linearReleases.length) {
+                total = total + self.linearReleases[i].getAmountAtTGE()
+                i = i + 1 
+            }
+            return total
+        }
+
+        pub fun getAmountAtTGEFor(amount: UFix64): UFix64 {
+            var total = 0.0
+            var i = 0
+            while (i < self.linearReleases.length && total == 0.0) {
+                if (self.linearReleases[i].totalAmount == amount) {
+                    total = total + self.linearReleases[i].getAmountAtTGE()
+                }
+                i = i + 1 
+            }
+            return total
+        }
+
+
+
+        pub fun getAmountAfterUnlockToPay(): UFix64 {
+            var total = 0.0
+            var i = 0
+            while (i < self.linearReleases.length) {
+                total = total + self.linearReleases[i].getAmountAfterUnlockToPay()
+                i = i + 1
+            }
+            return total
+        }
+
+        pub fun getAmountAfterUnlock(): UFix64 {
+            var total = 0.0
+            var i = 0
+            while (i < self.linearReleases.length) {
+                total = total + self.linearReleases[i].getAmountAfterUnlock()
+                i = i + 1
+            }
+            return total
+        }
+
+        pub fun getAmountAfterUnlockFor(amount: UFix64): UFix64 {
+            var total = 0.0
+            var i = 0
+            while (i < self.linearReleases.length && total == 0.0) {
+                if (self.linearReleases[i].totalAmount == amount) {
+                    total = total + self.linearReleases[i].getAmountAfterUnlock()
+                }
+                i = i + 1
+            }
+            return total
+        }
+
+        pub fun getDailyAmountToPay(): UFix64 {
+            var total = 0.0
+            var i = 0
+            while (i < self.linearReleases.length) {
+                total = total + self.linearReleases[i].getDailyAmountToPay()
+                i = i + 1
+            }
+            return total
+        }
+
+        pub fun getDailyAmount(): UFix64 {
+            var total = 0.0
+            var i = 0
+            while (i < self.linearReleases.length) {
+                total = total + self.linearReleases[i].getDailyAmount()
+                i = i + 1
+            }
+            return total
+        }
+
+        pub fun getTotalDailyAmount(): UFix64 {
+            var total = 0.0
+            var i = 0
+            while (i < self.linearReleases.length) {
+                total = total + self.linearReleases[i].getTotalDailyAmount()
+                i = i + 1
+            }
+            return total
+        }
+
+        pub fun getTotalDailyAmountFor(amount: UFix64): UFix64 {
+            var total = 0.0
+            var i = 0
+            while (i < self.linearReleases.length && total == 0.0) {
+                if (self.linearReleases[i].totalAmount == amount) {
+                    total = total + self.linearReleases[i].getTotalDailyAmount()
+                }
+                i = i + 1
+            }
+            return total
+        }
+
+        pub fun getTGEDate(): UFix64 {
+            return self.linearReleases[0].tgeDate
+        }
+        
+        pub fun getUnlockDate(): UFix64 {
+            return self.linearReleases[0].unlockDate
+        }
+
+        pub fun getFirstLinearRelease(): @LinearRelease.LinearSchedule {
+
+            return <-self.linearReleases.removeFirst()
+        }
+
+        init(amount: UFix64, linearRelease: @LinearRelease.LinearSchedule) {
             self.amount = amount
+            self.lastReleaseDate = linearRelease.tgeDate
+            self.linearReleases <- [<-linearRelease]
             self.amountReleased = 0.0
+            self.isAmountAtTGEPaid = false
+            self.isAmountAfterLockPaid = false
+        }
+
+        destroy() {
+            destroy self.linearReleases
         }
     }
 
     pub resource RoundReleases: RoundReleasesInfo {
-        access(contract) let releases: {String: RoundRelease}
+        access(contract) let releases: @{String: RoundRelease}
+        pub let lockedMOXYVault: Capability<&LockedToken.LockedVault>
+        pub let lockedMVVault: Capability<&LockedToken.LockedVault>
 
-        pub fun setAddress(roundId: String, roundRelease: RoundRelease) {
-            var round = self.releases[roundId]
-            if (round == nil) {
+        pub fun setAddress(roundId: String, roundRelease: @RoundRelease) {
+            if (self.releases[roundId] == nil) {
                 // Add to round
-                self.releases[roundId] = roundRelease
+                self.releases[roundId] <-! roundRelease
             } else {
-                // Update round adding the rounde release info
-                round!.increaseAmount(amount: roundRelease.amount)
-                self.releases[roundId] = round
+                // Update round adding the round release info increasing
+                // amount for an address that already has a release round
+                let amount = roundRelease.amount
+                let linearRelease <- roundRelease.getFirstLinearRelease()  
+
+                let release <- self.releases.remove(key: roundId)!
+                release.mergeWith(amount: amount, linearRelease: <-linearRelease)
+                
+                let old <- self.releases[roundId] <- release
+                destroy old
+                destroy roundRelease
+            }
+
+            
+
+        }
+
+        pub fun setStartDate(timestamp: UFix64) {
+            for roundId in self.releases.keys {
+                self.releases[roundId]?.setStartDate(timestamp: timestamp)!
             }
         }
         
-        pub fun payLinearRelease(roundId: String, roundRelease: RoundRelease) {
-            var round = self.releases[roundId]!
-            self.releases[roundId] = roundRelease
+        pub fun payLinearRelease(roundId: String): UFix64 {
+            let amount = self.releases[roundId]?.payLinearReleases()!
+
+            return amount
         }
         
-        pub fun getRoundRelease(roundId: String): RoundRelease? {
-            return self.releases[roundId]
+        // RoundReleases
+        pub fun allocateDailyReleaseToNow(feeRemaining: UFix64): @FungibleToken.Vault {
+            // Unlock MOXY tokens
+            let lockedMOXYVault = self.lockedMOXYVault.borrow()!
+            let moxyVault <- lockedMOXYVault.withdrawUnlocked()
+            
+            let address = lockedMOXYVault.owner!.address
+            let recipient = getAccount(address)
+            let moxyVaultRef = recipient.getCapability(MoxyToken.moxyTokenReceiverPath)
+                .borrow<&{FungibleToken.Receiver}>()
+                ?? panic("Could not borrow receiver reference to the recipient's Vault")
+            let moxyAmount = moxyVault.balance
+            var feeToDeduct = feeRemaining
+            if (feeToDeduct > moxyAmount) {
+                feeToDeduct = moxyAmount
+            }
+            let vaultFee <- moxyVault.withdraw(amount: feeToDeduct)
+
+            moxyVaultRef.deposit(from: <-moxyVault)
+            emit UnlockedMOXYTokenForLinearReleases(address: address, amount: moxyAmount)
+
+            // Unlock MV tokens
+            let lockedMVVault = self.lockedMVVault.borrow()
+            let mvVault <- lockedMOXYVault.withdrawUnlocked()
+            
+            let mvVaultRef = recipient.getCapability(MoxyToken.moxyTokenReceiverPath)
+                .borrow<&{FungibleToken.Receiver}>()
+                ?? panic("Could not borrow receiver reference to the recipient's Vault")
+            let mvAmount = mvVault.balance
+            mvVaultRef.deposit(from: <-mvVault)
+            emit UnlockedMOXYTokenForLinearReleases(address: address, amount: mvAmount)
+            return <-vaultFee
         }
 
-        init() {
-            self.releases = {}
+        pub fun getRoundReleaseInfo(roundId: String): RoundReleaseInfo {
+            return self.releases[roundId]?.getRoundReleaseInfo()!
+        }
+
+        pub fun getAmountFor(roundId: String ): UFix64 {
+            return self.releases[roundId]?.amount!
+        }
+
+        pub fun getAmountReleasedFor(roundId: String ): UFix64 {
+            return self.releases[roundId]?.amountReleased!
+        }
+
+        pub fun getTotalToAllocateNowFor(roundId: String ): UFix64 {
+            return self.releases[roundId]?.getTotalToAllocateNow()!
+        }
+
+        pub fun getAmountsDictFor(roundId: String, amount: UFix64 ): {String: UFix64} {
+            let amounts = {
+                            "atTGE": self.releases[roundId]?.getAmountAtTGEFor(amount: amount)!,
+                            "afterUnlock": self.releases[roundId]?.getAmountAfterUnlockFor(amount: amount)!,
+                            "daily": self.releases[roundId]?.getTotalDailyAmountFor(amount: amount)!
+                         }
+            return amounts
+        }
+
+
+        init(lockedMOXYVault: Capability<&LockedToken.LockedVault>, lockedMVVault: Capability<&LockedToken.LockedVault>) {
+            self.releases <- {}
+            self.lockedMOXYVault = lockedMOXYVault
+            self.lockedMVVault = lockedMVVault
+        }
+
+        destroy() {
+            destroy self.releases
         }
     }
 
-    pub struct Round {
+    pub resource Round {
         pub let id: String
         pub let type: String
         pub let name: String
@@ -85,31 +422,104 @@ pub contract MoxyReleaseRounds {
         pub let lockTime: Int 
         pub let months: Int
         pub var tgeDate: UFix64
-        pub var lastReleaseDate: UFix64
         access(self) var accounts: {Address: Capability<&RoundReleases>}
         pub var totalAllocated: UFix64
         pub var totalReleased: UFix64
+        pub var unlockPercentageAtTGE: UFix64
+        pub var unlockPercentageAfterLockTime: UFix64
+        pub var isReleaseStarted: Bool
+        pub let allocateBeforeTGE: Bool
+        pub var allocationQueue: @MoxyProcessQueue.Queue
 
-        pub fun getRoundRelease(_ address: Address): RoundRelease? {
-            if (self.accounts[address] == nil) {
-                return nil
-            }
-            return self.accounts[address]!.borrow()!.releases[self.id]
+        pub fun getRoundInfo(): RoundInfo {
+            return RoundInfo(id: self.id, type: self.type, name: self.name,
+                        initialRelease: self.initialRelease, 
+                        lockTime: self.lockTime, months: self.months, 
+                        days: Int(self.getDays()), tgeDate: self.tgeDate, 
+                        totalAllocated: self.totalAllocated, 
+                        totalReleased: self.totalReleased, 
+                        unlockPercentageAtTGE: self.unlockPercentageAtTGE, 
+                        unlockPercentageAfterLockTime: self.unlockPercentageAfterLockTime,
+                        isReleaseStarted: self.isReleaseStarted, 
+                        allocateBeforeTGE: self.allocateBeforeTGE)
         }
 
+        pub fun getRoundReleaseInfo(_ address: Address): RoundReleaseInfo? {
+            if (self.accounts[address] == nil) {
+               return nil
+            }
+            return self.accounts[address]!.borrow()!.getRoundReleaseInfo(roundId: self.id)
+        }
+
+        pub fun getAmountFor(address: Address): UFix64 {
+            if (self.accounts[address] == nil) {
+                log("(amount) Address not found: ".concat(address.toString()))
+                return 0.0
+            }
+            return self.accounts[address]!.borrow()!.getAmountFor(roundId: self.id)
+        }
+
+        pub fun getAmountReleasedFor(address: Address): UFix64 {
+            if (self.accounts[address] == nil) {
+                log("(amountReleased) Address not found: ".concat(address.toString()))
+                return 0.0
+            }
+            return self.accounts[address]!.borrow()!.getAmountReleasedFor(roundId: self.id)
+        }
+
+        pub fun getTotalToAllocateNowFor(address: Address): UFix64 {
+            return self.accounts[address]!.borrow()!.getTotalToAllocateNowFor(roundId: self.id)
+        }
+
+        pub fun getAmountsDictFor(address: Address, amount: UFix64): {String: UFix64} {
+            return self.accounts[address]!.borrow()!.getAmountsDictFor(roundId: self.id, amount: amount)
+        }
+
+
+
         pub fun getAccounts(): {Address: ParticipantRoundInfo} {
-             let accounts: {Address: ParticipantRoundInfo} = {}
+            let accounts: {Address: ParticipantRoundInfo} = {}
+  
             for address in self.accounts.keys {
-                let release = self.getRoundRelease(address)!
-                accounts[address] = ParticipantRoundInfo(address: address, roundId: self.id, amount: release.amount, amountReleased: release.amountReleased)
+
+                let amount =  self.getAmountFor(address: address)
+                let amountReleased =  self.getAmountReleasedFor(address: address)
+
+                accounts[address] = ParticipantRoundInfo(address: address, roundId: self.id, amount: amount, amountReleased: amountReleased)
             }
             return accounts;
+        }
+
+        pub fun getRoundAddresses(): [Address] {
+            return self.accounts.keys
         }
 
         pub fun getAllocationRemaining(): UFix64 {
             return self.initialRelease - self.totalAllocated
         }
 
+        pub fun isReadyToStartRelease(): Bool {
+            if (self.allocateBeforeTGE == false) {
+                // Can start because is not required full allocation before TGE (i.e presale round)
+                return true
+            }
+            return self.getAllocationRemaining() <= 0.0
+        }
+
+        pub fun isRoundStarted(): Bool {
+            return self.isReleaseStarted
+        }
+
+        pub fun canAllocateAfterTGE(): Bool {
+            return !self.allocateBeforeTGE
+        }
+
+        pub fun isInitialAllocationFinished(): Bool {
+            return self.hasQueueFinished() || 
+                    (self.canAllocateAfterTGE() && self.allocationQueue.isEmptyQueue())
+        }
+
+        //Round.setAddress
         access(contract) fun setAddress(address: Address, amount: UFix64, releasesRef: Capability<&RoundReleases>){
 
             // Adding reference to address
@@ -117,26 +527,29 @@ pub contract MoxyReleaseRounds {
                 self.accounts[address] = releasesRef
             }
 
+            let amountAtTGE = amount * (self.unlockPercentageAtTGE / 100.0)
+            let amountAfterLock = amount * (self.unlockPercentageAfterLockTime / 100.0)
+
             // Check if address is not already added to the round
             let roundReleases = self.accounts[address]!.borrow()!
-            let roundRelease = RoundRelease(amount: amount)
+            let linearRelease <- self.generateScheduleFor(amount: amount)
+            let roundRelease <- create RoundRelease(amount: amount, linearRelease: <-linearRelease)
 
-            roundReleases.setAddress(roundId: self.id, roundRelease: roundRelease)
+            roundReleases.setAddress(roundId: self.id, roundRelease: <-roundRelease)
+            self.allocationQueue.addAccount(address: address)
             
             self.totalAllocated = self.totalAllocated + amount
  
-            emit MoxyReleaseRounds.AccountAdded(address: address)
         }
 
-        pub fun payLinearRelease(_ address: Address, amount: UFix64) {
-            let roundRealease = self.getRoundRelease(address)!
-            roundRealease.payLinearRelease(amount: amount)
+        pub fun isAddressInRound(address: Address): Bool { 
+            return self.accounts.containsKey(address)
         }
 
-        pub fun allocateDailyReleaseToNow(serviceAccount: AuthAccount) {
-            if (!self.canStartReleasing()) {
-                log ("Cannot start allocation process, set TGE date to start.")
-                return 
+        // Round
+        pub fun allocateDailyReleaseToNow(address: Address) {
+            if (self.isInLockedPeriod()) {
+                return
             }
             
             // Get the daily round
@@ -144,57 +557,17 @@ pub contract MoxyReleaseRounds {
 
             // Get the amount from the last release to a given date
             let now = getCurrentBlock().timestamp
-            let amountToAllocate = self.getDailyAllocationTo(timestamp: now)
-
-            // Withdraw del total para hacer el release
-            // Get a reference to the signer's stored vault
-            let vaultRef = serviceAccount.borrow<&MoxyToken.Vault>(from: MoxyToken.moxyTokenVaultStorage)
-                ?? panic("Could not borrow reference to the owner's Vault!")
-            let allocationVault: @FungibleToken.Vault <- vaultRef.withdraw(amount: amountToAllocate)
-
-            // Allocate the amounts to the participants
-            for key in self.accounts.keys {
-                let releaseRound = self.getRoundRelease(key)!
-                let ratio = self.getReleaseRatioFor(address: key)
-                let amount = ratio * amountToAllocate
-                let roundReleasesRef = self.accounts[key]!
-                let roundReleases = roundReleasesRef.borrow()!
-
-                releaseRound.payLinearRelease(amount: amount)
-                roundReleases.payLinearRelease(roundId: self.id, roundRelease: releaseRound)
-                self.totalReleased = self.totalReleased + amount
-
-                // Deposit into participant account
-                let recipient = getAccount(key)
-                // Check if the round should give locked tokens
-                if (self.areTokensLockedForReleaseTo(timestamp: now)) {
-                    // Send locked tokens to recipient
-                    let receiverRef = recipient.getCapability(MoxyToken.moxyTokenLockedReceiverPath)
-                            .borrow<&{MoxyToken.Receiver}>()
-                            ?? panic("Could not borrow receiver reference to the recipient's Vault")
-
-                    // Deposit the withdrawn tokens in the recipient's receiver
-                    // The tokens will be locked upto the days defined on round with
-                    // starting point at TGE Date.
-                    let time = self.tgeDate + self.getLockedTokenTime()
-                    receiverRef.deposit(from: <-allocationVault.withdraw(amount: amount), time: time)
-                } else { 
-                    // send unlocked tokens to recipient
-                    let receiverRef = recipient.getCapability(MoxyToken.moxyTokenReceiverPath)
-                            .borrow<&{FungibleToken.Receiver}>()
-                            ?? panic("Could not borrow receiver reference to the recipient's Vault")
-
-                    // Deposit the withdrawn tokens in the recipient's receiver
-                    receiverRef.deposit(from: <-allocationVault.withdraw(amount: amount))
-                }
+            let amountToAllocate = self.getTotalToAllocateNowTo(address: address)
+            
+            if (amountToAllocate <= 0.0) {
+                log("Warning - No amount to allocate on Round: ".concat(self.id).concat(" Posible cause process already run."))
+                emit NoAmountToAllocateInRoundRelease(roundId: self.id, address: address, timestamp: now)
+                return
             }
-            // If residual tokens because of floating precition will return to service account.
-            self.totalReleased = self.totalReleased + allocationVault.balance
-            vaultRef.deposit(from: <-allocationVault)
-
-            // Update last release date
-            let days = self.getDaysFromLastReleaseTo(timestamp: now)
-            self.lastReleaseDate = self.lastReleaseDate + (UFix64(days) * 86400.0)
+            let totalToRelease = self.accounts[address]!.borrow()!.payLinearRelease(roundId: self.id)
+            
+            self.totalReleased = self.totalReleased + totalToRelease
+            emit RoundAllocationPerformed(roundId: self.id, address: address, totalReleased: totalToRelease, timestamp: now)
         }
 
         pub fun getReleaseRatioFor(address: Address): UFix64 {
@@ -202,17 +575,12 @@ pub contract MoxyReleaseRounds {
                 panic("Round does not have allocations yet. Release ratio could not be calculated")
             }
             
-            let amount = self.getRoundRelease(address)!.amount
+            let amount = self.getAmountFor(address: address)
             return amount / self.totalAllocated
         }
 
-        pub fun getDailyAllocationTo(timestamp: UFix64): UFix64 {
-            let days = self.getDaysFromLastReleaseTo(timestamp: timestamp)
-            if (days < 1) {
-                return 0.0
-            }
-
-            return UFix64(days) * self.dailyAllocationAmount()
+        pub fun getTotalToAllocateNowTo(address: Address): UFix64 {
+            return self.getTotalToAllocateNowFor(address: address)
         }
 
         pub fun getDailyAllocationsFrom(from: UFix64, to: UFix64): [UFix64] {
@@ -220,23 +588,29 @@ pub contract MoxyReleaseRounds {
             let to0000 = self.getTimestampTo0000(timestamp: to)
             let days = self.getDaysFromTo(from: from0000, to: to0000)
             let amount = self.dailyAllocationAmount()
-            return [from0000, to0000, UFix64(days), amount, self.tgeDate, self.getEndDate(),  self.lastReleaseDate]
+            
+            return [from0000, to0000, UFix64(days), amount, self.tgeDate, self.getEndDate()]
         }
 
         pub fun getDailyAllocationsFromToAddress(address: Address, from: UFix64, to: UFix64): [UFix64]? {
             let allocationInfo = self.getDailyAllocationsFrom(from: from, to: to)
-            let roundReleases = self.accounts[address]!.borrow()!
-            let roundRelease = roundReleases.getRoundRelease(roundId: self.id)
+            let amount =  self.getAmountFor(address: address)
+            let amountReleased =  self.getAmountReleasedFor(address: address)
             
-            allocationInfo.append(roundRelease!.amount)
-            allocationInfo.append(roundRelease!.amountReleased)
+            allocationInfo.append(amount)
+            allocationInfo.append(amountReleased)
             return allocationInfo
         }
 
-        pub fun getDaysFromLastReleaseTo(timestamp: UFix64) : UInt64 {
-            return UInt64((timestamp - self.lastReleaseDate) / 86400.0)
+/*         pub fun getDaysFromLastReleaseTo(address: Address, timestamp: UFix64) : UInt64 {
+            return UInt64((timestamp - self.getLastReleaseDateFor(address: address)) / 86400.0)
         }
-
+*/
+/*        pub fun getLastReleaseDateFor(address: Address): UFix64 {
+            let roundRelease = self.getRoundRelease(address)!
+            return roundRelease.lastReleaseDate
+        }
+*/
         pub fun getDaysFromTo(from: UFix64, to: UFix64): UInt64 {
             let from0000 = self.getTimestampTo0000(timestamp: from)
             let to0000 = self.getTimestampTo0000(timestamp: to)
@@ -244,26 +618,160 @@ pub contract MoxyReleaseRounds {
             return UInt64((to0000 - from0000) / 86400.0)
         }
 
-        pub fun setTGEDate(timestamp: UFix64) {
-            // I only update TGE if there are no allocations made
-            let timestampToStart = self.getTimestampTo0000(timestamp: timestamp)
-            if (!self.isReleaseProcesStarted()) {
-                self.tgeDate = timestampToStart
-                self.lastReleaseDate = timestampToStart
-            } else {
-                log("TGE Date could not be modified, release process already started.")
+        pub fun startReleaseAddress(address: Address, initialVault: @FungibleToken.Vault) {
+            pre {
+                !self.canAllocateAfterTGE() && !self.isReleaseStarted : "Release is already started."
             }
+
+            // Mint $MOXY Locked to addressess
+            var residualReceiver: &{LockedToken.Receiver}? = nil
+            var unlockDate = 0.0
+            let days = self.getDays()
+
+            let amountsDict = self.getAmountsDictFor(address: address, amount: initialVault.balance)!
+            let amount = initialVault.balance
+            
+            var am01 = amountsDict["atTGE"]!
+            var am02 = amountsDict["afterUnlock"]!
+            var am03 = amountsDict["daily"]!
+
+            let amountAtTGEVault <- initialVault.withdraw(amount: am01)
+            let amountAfterUnlockVault <- initialVault.withdraw(amount: am02)
+            let amountVault <- initialVault.withdraw(amount: am03)
+            // Deposit residual amount if any
+            amountVault.deposit(from: <-initialVault)
+
+            // Get the locked recipient Vault
+            let recipient = getAccount(address)
+            let receiverRef = recipient.getCapability(MoxyToken.moxyTokenLockedReceiverPath)
+                    .borrow<&{LockedToken.Receiver}>()
+                    ?? panic("Could not borrow receiver reference to the recipient's Vault (moxyTokenLockedReceiverPath)")
+
+            // Deposit the withdrawn tokens in the recipient's receiver
+            // The tokens will be locked upto the days defined on round with
+            // starting point at TGE Date.
+
+            receiverRef.depositFor(from: <-amountAtTGEVault, time: self.tgeDate)
+            receiverRef.depositFor(from: <-amountAfterUnlockVault, time: self.getUnlockDate())
+            
+            // Generate linear schedule to send to Locked Token
+            let schedule <- self.generateScheduleFor(amount: amountVault.balance)
+            
+            receiverRef.depositFromFixedSchedule(from: <-amountVault, schedule: <-schedule)
+            emit MOXYLockedTokensReleasedTo(round: self.id, address: address, amount: amount )
+        }
+
+        pub fun allocateAfterTGE(vault: @FungibleToken.Vault, address: Address) {
+            pre {
+                self.canAllocateAfterTGE() : "Round does not allow allocations after TGE started."
+            }
+            
+            let amountsDict = self.getAmountsDictFor(address: address, amount: vault.balance)!
+            let amount = vault.balance
+
+            var am01 = amountsDict["atTGE"]!
+            var am02 = amountsDict["afterUnlock"]!
+            var am03 = amountsDict["daily"]!
+
+            let amountAtTGEVault <- vault.withdraw(amount: am01)
+
+            let amountAfterUnlockVault <- vault.withdraw(amount: am02)
+
+            let amountVault <- vault.withdraw(amount: am03)
+
+            // Get recipient reference to assign release schedule
+            let recipient = getAccount(address)
+            let receiverRef = recipient.getCapability(MoxyToken.moxyTokenLockedReceiverPath)
+                    .borrow<&{LockedToken.Receiver}>()
+                    ?? panic("Could not borrow receiver reference to the recipient's Vault (moxyTokenLockedReceiverPath)")
+
+            // Deposit the withdrawn tokens in the recipient's receiver
+            // The tokens will be locked upto the days defined on round with
+            // starting point at TGE Date.
+            receiverRef.depositFor(from: <-amountAtTGEVault, time: self.tgeDate)
+            receiverRef.depositFor(from: <-amountAfterUnlockVault, time: self.getUnlockDate())
+
+            let schedule <- self.generateScheduleFor(amount: amount)
+
+            receiverRef.depositFromFixedSchedule(from: <-amountVault, schedule: <- schedule)
+            receiverRef.depositFor(from: <-vault, time: self.getUnlockDate())
+
+            emit MOXYLockedTokensReleasedTo(round: self.id, address: address, amount: amount )
+        }
+
+        pub fun getUnlockDate(): UFix64 {
+            return self.tgeDate + (UFix64(self.lockTime) * 86400.0)
+        }
+
+/*        pub fun generateLinearRelease(): LinearRelease {
+            if (self.linearRelease != nil) {
+                return self.linearRelease!
+            }
+            let amount = self.initialRelease
+            let unlockDate = self.getUnlockDate()
+
+            let unlockAtTGEAmount = amount * (self.unlockPercentageAtTGE / 100.0)
+            let unlockAfterLockTimeAmount = amount * (self.unlockPercentageAfterLockTime / 100.0)
+            
+            let totalDaily = amount - (unlockAtTGEAmount + unlockAfterLockTimeAmount)
+            let days = Int(self.getDays())
+            let dailyAmount = totalDaily / UFix64(days)
+
+            self.linearRelease = LinearRelease(tgeDate: self.tgeDate, totalAmount: amount, initialAmount: unlockAtTGEAmount, 
+                                                unlockDate: unlockDate, unlockAmount: unlockAfterLockTimeAmount,
+                                                days: days, dailyAmount: dailyAmount)
+
+            self.linearRelease!.generateSchedule()
+            return self.linearRelease!
+        }
+*/
+
+        // Generate a dictionary with the release schedule
+        // for an specified amount
+        pub fun generateScheduleFor(amount: UFix64): @LinearRelease.LinearSchedule {
+
+            let unlockAtTGEAmount = amount * (self.unlockPercentageAtTGE / 100.0)
+            let unlockAfterLockTimeAmount = amount * (self.unlockPercentageAfterLockTime / 100.0)
+            let totalToRelease = amount - (unlockAtTGEAmount + unlockAfterLockTimeAmount)
+            let days = Int(self.getDays())
+            let dailyAmount = totalToRelease / UFix64(days)
+            let unlockDate = self.getUnlockDate()
+
+           let newLinearRelease <- LinearRelease.createLinearSchedule(tgeDate: self.tgeDate, totalAmount: amount, initialAmount: unlockAtTGEAmount, unlockDate: unlockDate, unlockAmount: unlockAfterLockTimeAmount, days: days, dailyAmount: dailyAmount)
+            return <-newLinearRelease
+        }
+
+
+        pub fun getDaysFrom(months: Int): UFix64 {
+            // Dictionary represents the months in the left
+            // and the days in the right
+            let dictionary: {Int:Int} = {
+                24: 730,
+                20: 605,
+                16: 485,
+                12: 365,
+                10: 300,
+                6: 180,
+                3: 90,
+                1: 30,
+                0: 1
+            }
+            if (dictionary[months] == nil) {
+                log("Months no encontrado: ".concat(months.toString()))
+                return UFix64(months * 30)
+            }
+            return UFix64(dictionary[months]!)
+        }
+
+        pub fun getDays(): UFix64 {
+            return self.getDaysFrom(months: self.months)
         }
 
         pub fun getEndDate(): UFix64 {
             if (!self.isTGESet()) {
                 return 0.0
             }
-            return self.tgeDate + (UFix64(self.months) * 30.0 * 86400.0)
-        }
-
-        pub fun canStartReleasing(): Bool {
-            return self.isTGESet()
+            return self.tgeDate + (self.getDays() * 86400.0)
         }
 
         pub fun isTGESet(): Bool {
@@ -274,16 +782,12 @@ pub contract MoxyReleaseRounds {
             return self.totalReleased != 0.0
         }
 
-        pub fun areTokensLockedForReleaseTo(timestamp: UFix64): Bool {
-            // Returns true if tokens should be released as locked tokens
-            let time0000 = self.getTimestampTo0000(timestamp: timestamp)
-            let endLockTime = self.tgeDate + self.getLockedTokenTime()
-
-            return time0000 <= endLockTime
-        }
-
         pub fun getLockedTokenTime(): UFix64 {
             return UFix64(self.lockTime) * 86400.0
+        }
+
+        pub fun isInLockedPeriod(): Bool {
+            return getCurrentBlock().timestamp < (self.tgeDate + UFix64(self.lockTime) * 86400.0)  
         }
 
         pub fun getTimestampTo0000(timestamp: UFix64): UFix64 {
@@ -291,11 +795,11 @@ pub contract MoxyReleaseRounds {
             return UFix64(UInt64(days)) * 86400.0
         }
 
-        pub fun dailyAllocationAmount() :UFix64 {
+        pub fun dailyAllocationAmount():UFix64 {
             if (self.months == 0) {
                 return self.initialRelease
             }
-            let total = self.initialRelease / UFix64(self.months) / 30.0
+            let total = self.initialRelease / self.getDays() //UFix64(self.months) / 30.0
             return total
         }
 
@@ -303,12 +807,46 @@ pub contract MoxyReleaseRounds {
             if (self.isReleaseProcesStarted()) {
                 return
             }
-            let roundRelease = self.getRoundRelease(address)!
-            self.totalAllocated = self.totalAllocated - roundRelease.getAmount()
+            let amount =  self.getAmountFor(address: address)
+            self.totalAllocated = self.totalAllocated - amount
             self.accounts.remove(key: address)
         }
 
-        init(id: String, type: String, name: String, initialRelease: UFix64, lockTime: Int, months: Int){
+        pub fun setStartDate(timestamp: UFix64) {
+            self.tgeDate = timestamp
+
+            for address in self.accounts.keys {
+                self.accounts[address]!.borrow()!.setStartDate(timestamp: timestamp)
+
+            }
+        }
+
+        // Returns the number of accounts that this round will process
+        pub fun getAccountsToProcess(): Int {
+            return self.accounts.length
+        }
+
+        pub fun isQueueAtBegining(): Bool {
+            return self.allocationQueue.isAtBeginning()
+        }
+
+        pub fun hasQueueFinished(): Bool {
+            return self.allocationQueue.hasFinished()
+        }
+
+        pub fun getQueueNextAddresses(quantity: Int): [Address] {
+            return self.allocationQueue.getNextAddresses(cant: quantity)
+        }
+
+        pub fun completeNextAddresses(quantity: Int) {
+            self.allocationQueue.completeNextAddresses(quantity: quantity)
+        }
+
+        init(id: String, type: String, name: String, initialRelease: UFix64, lockTime: Int, months: Int, unlockPercentageAtTGE: UFix64, unlockPercentageAfterLockTime: UFix64, allocateBeforeTGE: Bool) {
+            pre {
+                unlockPercentageAtTGE + unlockPercentageAfterLockTime <= 100.0: "Unlock percentage could not be greater than 100%"
+            }
+
             self.id = id
             self.type = type
             self.name = name
@@ -318,78 +856,227 @@ pub contract MoxyReleaseRounds {
             self.accounts = {}
             self.totalAllocated = 0.0
             self.tgeDate = 0.0
-            self.lastReleaseDate = 0.0
             self.totalReleased = 0.0
+            self.unlockPercentageAtTGE = unlockPercentageAtTGE
+            self.unlockPercentageAfterLockTime = unlockPercentageAfterLockTime
+            self.isReleaseStarted = false
+            self.allocateBeforeTGE =  allocateBeforeTGE
+            self.allocationQueue <- MoxyProcessQueue.createNewQueue()
+        }
+
+        destroy() {
+            destroy self.allocationQueue
         }
     }
 
     pub resource Rounds: MoxyRoundsInfo {
-        access(contract) let rounds: {String: Round}
+        access(contract) let rounds: @{String: Round}
         access(self) let releases: {Address:Capability<&RoundReleases>}
+        pub let tgeDate: UFix64
 
-        pub fun getRound(_ id: String): Round? {
-            return self.rounds[id]
+        // Check if allocatin is complete on all release rounds
+        pub fun isReadyToStartRelease(): Bool {
+            for roundId in self.rounds.keys {
+                let isReady = self.rounds[roundId]?.isReadyToStartRelease()!
+                if (!isReady) {
+                    return false
+                }
+            }
+            return true
         }
 
-        pub fun addRound(_ id: String, type: String, name: String, initialRelease: UFix64, lockTime: Int, months: Int) {
-            let round = Round(id: id, type: type, name: name, initialRelease: initialRelease, lockTime: lockTime, months: months)
-            self.rounds[id] = round
+        pub fun getAccountsToProcess(): Int {
+            var quantity = 0
+            for roundId in self.rounds.keys {
+                quantity = quantity + self.rounds[roundId]?.getAccountsToProcess()!
+            }
+            return quantity
+        }
+
+        pub fun completeNextAddresses(roundId: String, quantity: Int) {
+            self.rounds[roundId]?.completeNextAddresses(quantity: quantity)!
+        }
+
+        pub fun allocateAfterTGE(roundId: String, vault: @FungibleToken.Vault, address: Address) {
+            let round <- self.rounds.remove(key: roundId)!
+            round.allocateAfterTGE(vault: <-vault, address: address)
+            let old <- self.rounds[roundId] <- round
+            destroy old
+        }
+
+        pub fun getAmountFor(roundId: String, address: Address): UFix64 {
+            return self.rounds[roundId]?.getAmountFor(address: address)!
+        }
+
+        pub fun isReadyToStartReleaseTo(roundId: String): Bool {
+            return self.rounds[roundId]?.isReadyToStartRelease()!
+        }
+
+        pub fun haveAllRoundsStarted(): Bool {
+            for roundId in self.rounds.keys {
+                let isStarted = self.rounds[roundId]?.isReleaseStarted!
+                if (!isStarted) {
+                    return false
+                }
+            }
+            return true
+        }
+
+        pub fun isQueueAtBegining():Bool {
+            for roundId in self.rounds.keys {
+                let isAtBegining = self.rounds[roundId]?.isQueueAtBegining()!
+                if (!isAtBegining) {
+                    return false
+                }
+            }
+            return true
+        }
+
+        pub fun haveAllQueuesFinished():Bool {
+            for roundId in self.rounds.keys {
+                let isFinished = self.rounds[roundId]?.hasQueueFinished()!
+                if (!isFinished) {
+                    return false
+                }
+            }
+            return true
+        }
+
+        pub fun initialAllocationFinished():Bool {
+            // Check if all queues are finished but not in the cases
+            // that the releasee can start after TGE 
+            for roundId in self.rounds.keys {
+                let isFinished = self.rounds[roundId]?.isInitialAllocationFinished()!
+                if (!isFinished) {
+                    return false
+                }
+            }
+            return true
+        }
+
+        pub fun getRoundsNames(): [String] {
+            return self.rounds.keys
+        }
+
+        pub fun hasQueueFinished(roundId: String): Bool {
+            return self.rounds[roundId]?.hasQueueFinished()!
+        }
+
+        pub fun getQueueNextAddresses(roundId: String, quantity: Int): [Address] {
+            return self.rounds[roundId]?.getQueueNextAddresses(quantity: quantity)!
+        }
+
+        pub fun getRoundsLength(): Int {
+            return self.rounds.length
+        }
+
+
+        pub fun setStartDate(timestamp: UFix64) {
+            for roundId in self.rounds.keys {
+                self.rounds[roundId]?.setStartDate(timestamp: timestamp)!
+            }
+        }
+
+        pub fun getAddresses(): [Address] {
+            return self.releases.keys
+        }
+
+        pub fun getRoundAddresses(roundId: String): [Address] {
+            return self.rounds[roundId]?.getRoundAddresses()!
+        }
+
+        pub fun addRound(_ id: String, type: String, name: String, initialRelease: UFix64, lockTime: Int, months: Int, unlockPercentageAtTGE: UFix64, unlockPercentageAfterLockTime: UFix64, allocateBeforeTGE: Bool) {
+            let round <- create Round(id: id, type: type, name: name, initialRelease: initialRelease, lockTime: lockTime, months: months, unlockPercentageAtTGE: unlockPercentageAtTGE, unlockPercentageAfterLockTime: unlockPercentageAfterLockTime, allocateBeforeTGE: allocateBeforeTGE)
+            round.setStartDate(timestamp: self.tgeDate)
+            let old <- self.rounds[id] <- round
+            destroy old
             emit MoxyReleaseRounds.RoundAdded(name: name)
         }
 
-        pub fun setAddress(roundId: String, acct: AuthAccount, amount: UFix64){
-            
-            // Make a new resource to store the roundID in the key and
-            // a structure with the RoundRelease (with amount and amount released) in value
-            let round = self.rounds[roundId]!
-            if (round.isReleaseProcesStarted()) {
+        pub fun createRoundReleases(lockedMOXYVault: Capability<&LockedToken.LockedVault>, lockedMVVault: Capability<&LockedToken.LockedVault>): @RoundReleases {
+            return <- create RoundReleases(lockedMOXYVault: lockedMOXYVault, lockedMVVault: lockedMVVault)
+        }
+
+        pub fun acceptRounds(address: Address, releasesRef: Capability<&MoxyReleaseRounds.RoundReleases>){
+            // User consents to partipate in rounds releases            
+
+            if (self.releases[address] != nil ) {
+                log("Address already accepted the Rounds participation.")
+                emit AccountAlreadyAcceptedRoundParticipation(address: address, timestamp: getCurrentBlock().timestamp)
                 return
             }
+
+            // Capability added to releases collection for user future 
+            // rounds participations
+            self.releases[address] = releasesRef
+
+            emit AccountAcceptedRoundsParticipation(address: address, timestamp: getCurrentBlock().timestamp)
+        }
+
+        pub fun addressHasAcceptedRounds(address: Address): Bool {
+            return self.releases[address] != nil
+        }
+
+        pub fun fullAllocateTo(roundId: String, address: Address) {
+            let amount = self.rounds[roundId]?.getAllocationRemaining()!
+            self.setAddress(roundId: roundId, address: address, amount: amount)
+        }
+
+        //Rounds.setAddress
+        pub fun setAddress(roundId: String, address: Address, amount: UFix64) {
             
-            if (round.getAllocationRemaining() < amount ) {
-                panic("Amount exceeds initial Allocation. Max to allocate is ".concat(round.getAllocationRemaining().toString()))
+            if (self.releases[address] == nil) {
+                panic("Required accept consent from address: ".concat(address.toString()))
             }
 
-            if (self.releases[acct.address] == nil) {
-                // Create the resource
-                let releases <- create RoundReleases()
-                // Store the resoure in the account storage
-        		acct.save(<-releases, to: MoxyReleaseRounds.roundReleasesStorage)
+            // Make a new resource to store the roundID in the key and
+            // a structure with the RoundRelease (with amount and amount released) in value
+            let alreadyStarted = !self.rounds[roundId]?.canAllocateAfterTGE()! && self.rounds[roundId]?.isReleaseProcesStarted()!
+            let exceedsAllocation = self.rounds[roundId]?.getAllocationRemaining()! < amount
+            if (alreadyStarted || exceedsAllocation) {
+                var message = ""
+                if (alreadyStarted) {
+                    message = roundId.concat(" - Cannot allocate to round: process already started")
+                } else {
+                    message = roundId.concat(" - Amount exceeds initial Allocation. Max to allocate is ".concat(self.rounds[roundId]?.getAllocationRemaining()!.toString()))
+                } 
+                panic(message)
+            } else {
+                // Sets the address
+                let releasesRef = self.releases[address]!
+                self.rounds[roundId]?.setAddress(address: address, amount: amount, releasesRef: releasesRef)!
+            }
 
-                // Create capability
-                let releasesRef2 = acct.link<&MoxyReleaseRounds.RoundReleases>(
-                        MoxyReleaseRounds.roundReleasesPrivate, 
-                        target: MoxyReleaseRounds.roundReleasesStorage)!
-
-                // Create public access to resource information
-                acct.link<&MoxyReleaseRounds.RoundReleases{RoundReleasesInfo}>(
-                        MoxyReleaseRounds.roundReleasesInfoPublic, 
-                        target: MoxyReleaseRounds.roundReleasesStorage)!
-
-                self.releases[acct.address] = releasesRef2
-                
-            } 
-            let releasesRef = self.releases[acct.address]!
-            round.setAddress(address: acct.address, amount: amount, releasesRef: releasesRef)
-            self.rounds[roundId] = round
         }
 
-        pub fun payLinearRelease(roundId: String, address: Address, amount: UFix64){
-            self.rounds[roundId]?.payLinearRelease(address, amount: amount)
+        // Rounds
+        pub fun startReleaseRound(roundId: String, address: Address, initialVault: @FungibleToken.Vault) {
+            let round <- self.rounds.remove(key: roundId)!
+            let amount = round.totalAllocated
+            round.startReleaseAddress(address: address, initialVault: <-initialVault)
+            let old <- self.rounds[roundId] <- round
+            destroy old
         }
 
-        pub fun allocateDailyReleaseToNow(roundId: String, serviceAccount: AuthAccount) {
-            let round = self.rounds[roundId]!
-            round.allocateDailyReleaseToNow(serviceAccount: serviceAccount)
-            self.rounds[roundId] = round
+
+        pub fun hasRoundRelease(address: Address): Bool {
+            return self.releases[address] != nil
         }
+
+        pub fun allocateDailyReleaseNowToAddress(address: Address, feeRemaining: UFix64): @FungibleToken.Vault {
+            let roundReleases = self.releases[address]!.borrow()!
+            let feeVault <- roundReleases.allocateDailyReleaseToNow(feeRemaining: feeRemaining)
+            for roundId in roundReleases.releases.keys {
+                if (self.rounds[roundId]?.isAddressInRound(address: address)!) {
+                    self.rounds[roundId]?.allocateDailyReleaseToNow(address: address)!
+                }
+            }
+            return <-feeVault
+        }
+
 
         pub fun removeAddress(roundId: String, address: Address){
             self.rounds[roundId]?.removeAddress(address: address)
-        }
-
-        pub fun setTGEDate(roundId: String, timestamp: UFix64) {
-            self.rounds[roundId]?.setTGEDate(timestamp: timestamp)
         }
 
         pub fun getAllocationRemaining(_ id: String):UFix64? {
@@ -403,11 +1090,13 @@ pub contract MoxyReleaseRounds {
             return self.rounds[roundId]?.getDailyAllocationsFromToAddress(address: address, from: from, to: to)
         }
 
-        pub fun getRoundRelease(_ id: String,  address: Address): RoundRelease?? {
-            let round = self.rounds[id]
-            let roundRelease = round?.getRoundRelease(address)
-            
-            return roundRelease
+        pub fun getAmountReleasedFor(roundId: String, address: Address): UFix64 {
+            return self.rounds[roundId]?.getAmountReleasedFor(address: address)!
+        }
+
+        pub fun getRoundReleaseInfo(_ id: String,  address: Address): RoundReleaseInfo? {
+            let roundInfo = self.rounds[id]?.getRoundReleaseInfo(address)!
+            return roundInfo
         }
 
         pub fun getAccounts(_ id: String): {Address: ParticipantRoundInfo}? {
@@ -416,19 +1105,27 @@ pub contract MoxyReleaseRounds {
 
         pub fun getRoundsForAddress(address: Address): {String: ParticipantRoundInfo} {
             let rounds: {String: ParticipantRoundInfo} = {}
-            for round in self.rounds.values {
-                let result = round.getRoundRelease(address)
-                if (result != nil) {
-                    // Add to the round
-                    rounds[round.id] = ParticipantRoundInfo(address: address, roundId: round.id, amount: result!.amount, amountReleased: result!.amountReleased)
-                }
+            for roundId in self.rounds.keys {
+                let amount =  self.getAmountFor(roundId: roundId, address: address)
+                let amountReleased =  self.getAmountReleasedFor(roundId: roundId, address: address)
+                rounds[roundId] = ParticipantRoundInfo(address: address, roundId: roundId, amount: amount, amountReleased: amountReleased)
             }
             return rounds
         }
 
+        pub fun getRoundInfo(roundId: String): RoundInfo {
+            return self.rounds[roundId]?.getRoundInfo()!
+        }
+
         init() {
-            self.rounds = {}
+            self.rounds <- {}
             self.releases = {}
+            // TGE Date set to SEP 1st, 2022
+            self.tgeDate = 1662001200.0     //TODO: Assign real tgeDate on mainnet
+        }
+
+        destroy() {
+            destroy self.rounds
         }
     }
 
@@ -438,14 +1135,14 @@ pub contract MoxyReleaseRounds {
             .borrow<&MoxyReleaseRounds.Rounds>()!
     }
 
-    pub fun getRound(_ id: String): Round?{
-        let roundsManager = self.getRoundsCapability()
-        return roundsManager.getRound(id)
-    }
-
     pub fun getRounds(): [String] {
         let roundsManager = self.getRoundsCapability()
         return roundsManager.rounds.keys
+    }
+
+    pub fun getTimestampTo0000(timestamp: UFix64): UFix64 {
+        let days = timestamp / 86400.0
+        return UFix64(UInt64(days)) * 86400.0
     }
 
     pub resource interface RoundReleasesInfo {
@@ -458,7 +1155,13 @@ pub contract MoxyReleaseRounds {
         pub fun getDailyAllocationsFrom(roundId: String, from: UFix64, to: UFix64): [UFix64]?
         pub fun getDailyAllocationsFromToAddress(roundId: String, address: Address, from: UFix64, to: UFix64): [UFix64]??
         pub fun getAccounts(_ id: String): {Address: ParticipantRoundInfo}? 
-        pub fun getRoundRelease(_ id: String, address: Address): RoundRelease?? 
+        pub fun addressHasAcceptedRounds(address: Address): Bool
+        pub fun getAddresses(): [Address]
+        pub fun getRoundAddresses(roundId: String): [Address]
+        pub fun getRoundReleaseInfo(_ id: String,  address: Address): RoundReleaseInfo?
+        pub fun haveAllQueuesFinished():Bool
+        pub fun initialAllocationFinished():Bool
+        pub fun getRoundInfo(roundId: String): RoundInfo
     }
 
 
@@ -476,24 +1179,23 @@ pub contract MoxyReleaseRounds {
         // Moxy Rounds initialization
         let moxyRounds <- create Rounds()
 
-        moxyRounds.addRound("seed", type: "Token Sale", name: "Seed", initialRelease: 45000000.0, lockTime: 30, months: 24)
-        moxyRounds.addRound("private_1", type: "Token Sale", name: "Private 1", initialRelease: 75000000.0, lockTime: 0, months: 20)
-        moxyRounds.addRound("private_2", type: "Token Sale", name: "Private 2", initialRelease: 120000000.0, lockTime: 0, months: 16)
-        moxyRounds.addRound("public_presale", type: "Token Sale", name: "Public Whitelist", initialRelease: 18000000.0, lockTime: 0, months: 10)
-        moxyRounds.addRound("public_ido", type: "Token Sale", name: "Public IDO", initialRelease: 4500000.0, lockTime: 30, months: 0)
+        moxyRounds.addRound("seed", type: "Token Sale", name: "Seed", initialRelease: 45000000.0, lockTime: 0, months: 24, unlockPercentageAtTGE: 0.0, unlockPercentageAfterLockTime: 0.0, allocateBeforeTGE: true)
+        moxyRounds.addRound("private_1", type: "Token Sale", name: "Private 1", initialRelease: 75000000.0, lockTime: 0, months: 20, unlockPercentageAtTGE: 0.0, unlockPercentageAfterLockTime: 0.0, allocateBeforeTGE: true)
+        moxyRounds.addRound("private_2", type: "Token Sale", name: "Private 2", initialRelease: 113500000.0, lockTime: 0, months: 16, unlockPercentageAtTGE: 0.0, unlockPercentageAfterLockTime: 0.0, allocateBeforeTGE: true)
+        moxyRounds.addRound("public_presale", type: "Token Sale", name: "Public Whitelist", initialRelease: 18000000.0, lockTime: 0, months: 10, unlockPercentageAtTGE: 20.0, unlockPercentageAfterLockTime: 0.0, allocateBeforeTGE: false)
+        moxyRounds.addRound("public_ido", type: "Token Sale", name: "Public IDO", initialRelease: 11000000.0, lockTime: 0, months: 0, unlockPercentageAtTGE: 100.0, unlockPercentageAfterLockTime: 0.0, allocateBeforeTGE: true)
 
-        moxyRounds.addRound("team", type: "Token Allocation", name: "Team", initialRelease: 225000000.0, lockTime: 365, months: 24)
-        moxyRounds.addRound("moxy_foundation", type: "Token Allocation", name: "Moxy Foundation", initialRelease: 375000000.0, lockTime: 180, months: 24)
-        moxyRounds.addRound("advisors", type: "Token Allocation", name: "Advisors", initialRelease: 75000000.0, lockTime: 180, months: 24)
-        moxyRounds.addRound("treasury", type: "Token Allocation", name: "Treasury", initialRelease: 150000000.0, lockTime: 90, months: 24)
-        moxyRounds.addRound("ecosystem", type: "Token Allocation", name: "Ecosystem", initialRelease: 412500000.0, lockTime: 180, months: 24)
+        moxyRounds.addRound("team", type: "Token Allocation", name: "Team", initialRelease: 225000000.0, lockTime: 365, months: 24, unlockPercentageAtTGE: 0.0, unlockPercentageAfterLockTime: 0.0, allocateBeforeTGE: true)
+        moxyRounds.addRound("moxy_foundation", type: "Token Allocation", name: "Moxy Foundation", initialRelease: 375000000.0, lockTime: 180, months: 24, unlockPercentageAtTGE: 15.0, unlockPercentageAfterLockTime: 0.0, allocateBeforeTGE: true)
+        moxyRounds.addRound("advisors", type: "Token Allocation", name: "Advisors", initialRelease: 75000000.0, lockTime: 180, months: 24, unlockPercentageAtTGE: 0.0, unlockPercentageAfterLockTime: 0.0, allocateBeforeTGE: true)
+        moxyRounds.addRound("treasury", type: "Token Allocation", name: "Treasury", initialRelease: 150000000.0, lockTime: 90, months: 24, unlockPercentageAtTGE: 0.0, unlockPercentageAfterLockTime: 25.0, allocateBeforeTGE: true)
+        moxyRounds.addRound("ecosystem", type: "Token Allocation", name: "Ecosystem", initialRelease: 412500000.0, lockTime: 180, months: 24, unlockPercentageAtTGE: 0.0, unlockPercentageAfterLockTime: 0.0, allocateBeforeTGE: true)
 
         // Storage of Rounds
         self.moxyRoundsStorage = /storage/moxyRounds
         self.moxyRoundsPrivate = /private/moxyRounds
         self.moxyRoundsInfoPublic = /public/moxyRoundsInfoPublic
 
-        
         self.account.save(<-moxyRounds, to: self.moxyRoundsStorage)
         self.account.link<&MoxyReleaseRounds.Rounds>(self.moxyRoundsPrivate, target: self.moxyRoundsStorage)
         self.account.link<&MoxyReleaseRounds.Rounds{MoxyRoundsInfo}>(
@@ -506,4 +1208,3 @@ pub contract MoxyReleaseRounds {
         self.roundReleasesInfoPublic = /public/roundReleaseInfoPublic
     }
 }
- 

@@ -1,4 +1,6 @@
 import FungibleToken from "./flow/FungibleToken.cdc"
+import LockedToken from "./LockedToken.cdc"
+import MoxyVaultToken from "./MoxyVaultToken.cdc"
 
 pub contract MoxyToken: FungibleToken {
 
@@ -39,6 +41,14 @@ pub contract MoxyToken: FungibleToken {
     ///
     /// The event that is emitted when a new burner resource is created
     pub event BurnerCreated()
+
+    pub event MOXtoMVConvertionRequested(address: Address, amount: UFix64)
+
+    /// LockedTokensWithdrawn
+    ///
+    /// The event that is emitted when locked tokens are withdrawn from a Vault
+    /// due to an MV to MOX convert request
+    pub event LockedTokensWithdrawn(amount: UFix64, from: Address?)
 
     /// Vault
     ///
@@ -96,6 +106,37 @@ pub contract MoxyToken: FungibleToken {
             destroy vault
         }
 
+        pub fun convertToMV(amount: UFix64) {
+            // Converting MOXY to MV locks the MOXY
+
+            let vault <- self.withdraw(amount: amount)
+
+            // Get a reference to the recipient's Receiver
+            let userRef = self.owner!.getCapability(MoxyToken.moxyTokenLockedMVReceiverPath)
+                .borrow<&{LockedToken.Receiver}>()
+                ?? panic("Could not borrow receiver reference to the recipient's Vault")
+
+            // Deposit the withdrawn tokens in the recipient's receiver
+            userRef.deposit(from: <- vault)
+
+            // Create an MV minter with the same amount of MOX locked
+            let tokenAdmin = MoxyToken.account.borrow<&MoxyVaultToken.Administrator>(from: MoxyVaultToken.moxyVaultTokenAdminStorage)
+                ?? panic("Signer is not the token admin")
+            
+            let minter <- tokenAdmin.createNewMinter(allowedAmount: amount)
+            let mintedVault <- minter.mintTokens(amount: amount)
+            // Get a reference to the recipient's Receiver
+
+            let userMVRef = self.owner!.getCapability(MoxyVaultToken.moxyVaultTokenReceiverPath)
+                .borrow<&{FungibleToken.Receiver}>()
+                ?? panic("Could not borrow receiver reference to the recipient's Vault")
+
+            // Deposit the withdrawn tokens in the recipient's receiver
+            userMVRef.deposit(from: <- mintedVault)
+
+            destroy minter
+        }
+
         destroy() {
             MoxyToken.totalSupply = MoxyToken.totalSupply - self.balance
         }
@@ -112,8 +153,8 @@ pub contract MoxyToken: FungibleToken {
         return <-create Vault(balance: 0.0)
     }
 
-    pub fun createEmptyLockedVault(): @LockedVault {
-        return <-create LockedVault()
+    pub fun createEmptyLockedVault(): @LockedToken.LockedVault {
+        return <- LockedToken.createLockedVault(vault: <- self.createEmptyVault())
     }
 
     pub resource Administrator {
@@ -122,7 +163,7 @@ pub contract MoxyToken: FungibleToken {
         ///
         /// Function that creates and returns a new minter resource
         ///
-        pub fun createNewMinter(allowedAmount: UFix64): @Minter {
+        access(account) fun createNewMinter(allowedAmount: UFix64): @Minter {
             emit MinterCreated(allowedAmount: allowedAmount)
             return <-create Minter(allowedAmount: allowedAmount)
         }
@@ -131,10 +172,11 @@ pub contract MoxyToken: FungibleToken {
         ///
         /// Function that creates and returns a new burner resource
         ///
-        pub fun createNewBurner(): @Burner {
+        access(account) fun createNewBurner(): @Burner {
             emit BurnerCreated()
             return <-create Burner()
         }
+
     }
 
     /// Minter
@@ -151,9 +193,9 @@ pub contract MoxyToken: FungibleToken {
         /// Function that mints new tokens, adds them to the total supply,
         /// and returns them to the calling context.
         ///
-        pub fun mintTokens(amount: UFix64): @MoxyToken.Vault {
+        access(account) fun mintTokens(amount: UFix64): @MoxyToken.Vault {
             pre {
-                amount > 0.0: "Amount minted must be greater than zero"
+                amount > 0.0: "Amount mined must be greater than zero ".concat(amount.toString())
                 amount <= self.allowedAmount: "Amount minted must be less than the allowed amount"
             }
             MoxyToken.totalSupply = MoxyToken.totalSupply + amount
@@ -188,140 +230,45 @@ pub contract MoxyToken: FungibleToken {
         }
     }
 
-    pub resource LockedVault: Receiver, Balance {
-        access(contract) var lockedBalances: {UFix64:UFix64}
-        access(contract) var vault: @FungibleToken.Vault
-
-        pub fun getBalance():UFix64 {
-            return self.vault.balance
-        }
-
-        pub fun getLockedBalances(): {UFix64:UFix64} {
-            return self.lockedBalances
-        }
-
-        pub fun deposit(from: @FungibleToken.Vault, time: UFix64) {
-            let amount = from.balance
-            self.vault.deposit(from: <-from)
-            if (self.lockedBalances[time] == nil) {
-                self.lockedBalances[time] = 0.0
-            } 
-            self.lockedBalances[time] = self.lockedBalances[time]! + amount
-        }
-
-        pub fun unlockOverdueMOX() {
-            var total = 0.0
-            let dict = self.getUnlockBalancesFor(days: 0.0)
-            for key in dict.keys {
-                let value = dict[key]!
-                self.unlockBalance(timestamp: key)
-            }
-        }
-
-        access(contract) fun unlockBalance(timestamp: UFix64) {
-            // Obtener el valor del diccionario
-            // hacer el withdraw
-            // remover el valor del diccionario
-            let amount = self.lockedBalances[timestamp]
-            if (amount == nil) {
-                return
-            }
-            let vault <- self.vault.withdraw(amount: amount!)
-            // Buscar la referencia del vault receiver del usuario
-
-            // Get a reference to the recipient's Receiver
-            let userRef = self.owner!.getCapability(MoxyToken.moxyTokenReceiverPath)
-                .borrow<&{FungibleToken.Receiver}>()
-                ?? panic("Could not borrow receiver reference to the recipient's Vault")
-
-            // Deposit the withdrawn tokens in the recipient's receiver
-            userRef.deposit(from: <- vault)
-            self.lockedBalances.remove(key: timestamp)
-        }
-
-        pub fun getTotalLockedBalance(): UFix64 {
-            return self.vault.balance
-        }
-
-        pub fun getTotalToUnlockBalanceFor(days: UFix64): UFix64 {
-            // Returns how many MOX will be unlocked in the next few days
-            var total = 0.0
-            var timestamp = getCurrentBlock().timestamp + (days * 86400.0)
-            for key in self.lockedBalances.keys {
-                if (key < timestamp) {
-                    let value = self.lockedBalances[key]!
-                    total = total + value
-                }
-            }
-            return total
-        }
-
-        pub fun getUnlockBalancesFor(days: UFix64): {UFix64:UFix64} {
-            // Returns a dictionary with the MOX that will be unlocked in the next few days
-            var dict: {UFix64:UFix64} = {} 
-            var timestamp = getCurrentBlock().timestamp + (days * 86400.0)
-            for key in self.lockedBalances.keys {
-                if (key < timestamp) {
-                    dict[key] = self.lockedBalances[key]! 
-                }
-            }
-            return dict
-        }
-
-        destroy() {
-            destroy self.vault
-        }
-
-        init() {
-            self.lockedBalances = {}
-            self.vault <- MoxyToken.createEmptyVault()
-        }
-    }
-
-    pub fun getTotalSuply(): UFix64 {
-        return self.totalSupply
-    }
-
-    pub resource interface Receiver {
-
-        /// deposit takes a Vault and deposits it into the implementing resource type
-        ///
-        pub fun deposit(from: @FungibleToken.Vault, time: UFix64)
-        pub fun unlockOverdueMOX()
-    }
-
-    pub resource interface Balance {
-
-        /// The total balance of a vault
-        ///
-        pub fun getBalance():UFix64
-        pub fun getLockedBalances(): {UFix64:UFix64} 
-        pub fun getTotalToUnlockBalanceFor(days: UFix64): UFix64 
-        pub fun getTotalLockedBalance(): UFix64 
-        
-    }
-
     pub let moxyTokenVaultStorage: StoragePath
     pub let moxyTokenLockedVaultStorage: StoragePath
+    pub let moxyTokenLockedVaultPrivate: PrivatePath
     pub let moxyTokenAdminStorage: StoragePath
     pub let moxyTokenReceiverPath: PublicPath
     pub let moxyTokenBalancePath: PublicPath
     pub let moxyTokenLockedBalancePath: PublicPath
     pub let moxyTokenLockedReceiverPath: PublicPath
+    // Paths for Locked tonkens due MOX to MV conversion
+    pub let moxyTokenLockedMVVaultStorage: StoragePath
+    pub let moxyTokenLockedMVBalancePath: PublicPath
+    pub let moxyTokenLockedMVReceiverPath: PublicPath
+    // Play and Earn Paths
+    pub let moxyTokenPlayAndEarnVaultStorage: StoragePath
+    pub let moxyTokenPlayAndEarnVaultPrivate: PrivatePath
+    pub let moxyTokenPlayAndEarnBalancePath: PublicPath
 
     init() {
         // The initial total supply corresponds with the total amount
         // to release in the different Token allocations rounds
-        self.totalSupply = 1500000000.0
+        self.totalSupply = 0.0
 
         self.moxyTokenVaultStorage = /storage/moxyTokenVault
         self.moxyTokenLockedVaultStorage = /storage/moxyTokenLockedVault
+        self.moxyTokenLockedVaultPrivate = /private/moxyTokenLockedVault
         self.moxyTokenAdminStorage = /storage/moxyTokenAdmin
         self.moxyTokenReceiverPath = /public/moxyTokenReceiver
         self.moxyTokenBalancePath = /public/moxyTokenBalance
         self.moxyTokenLockedBalancePath = /public/moxyTokenLockedBalance
         self.moxyTokenLockedReceiverPath = /public/moxyTokenLockedReceiver
-      
+        // Locked vaults due to MOX to MV conversion
+        self.moxyTokenLockedMVVaultStorage = /storage/moxyTokenLockedMVVault
+        self.moxyTokenLockedMVBalancePath = /public/moxyTokenLockedMVBalance
+        self.moxyTokenLockedMVReceiverPath = /public/moxyTokenLockedMVReceiver
+        //Play and Earn Storage
+        self.moxyTokenPlayAndEarnVaultStorage = /storage/moxyTokenPlayAndEarnVault
+        self.moxyTokenPlayAndEarnVaultPrivate = /private/moxyTokenPlayAndEarnVault
+        self.moxyTokenPlayAndEarnBalancePath = /public/moxyTokenPlayAndEarnBalance
+
         // Create the Vault with the total supply of tokens and save it in storage
         //
         let vault <- create Vault(balance: self.totalSupply)
@@ -344,20 +291,53 @@ pub contract MoxyToken: FungibleToken {
         )
 
         // Create locked Vault and links
-        let lockedVault <- create LockedVault()
+        let lockedVault <- self.createEmptyLockedVault()
         self.account.save(<-lockedVault, to: self.moxyTokenLockedVaultStorage)
 
-        self.account.link<&MoxyToken.LockedVault{MoxyToken.Balance}>(
+        self.account.link<&LockedToken.LockedVault>(
+            self.moxyTokenLockedVaultPrivate,
+            target: self.moxyTokenLockedVaultStorage
+        )
+
+        self.account.link<&LockedToken.LockedVault{LockedToken.Balance}>(
             self.moxyTokenLockedBalancePath,
             target: self.moxyTokenLockedVaultStorage
         )
 
-        self.account.link<&{MoxyToken.Receiver}>(
+        self.account.link<&{LockedToken.Receiver}>(
             self.moxyTokenLockedReceiverPath,
             target: self.moxyTokenLockedVaultStorage
         )
 
+        // Create locked Vault and links for MOX converted to MV
+        let lockedMVVault <- self.createEmptyLockedVault()
+        self.account.save(<-lockedMVVault, to: self.moxyTokenLockedMVVaultStorage)
 
+        self.account.link<&LockedToken.LockedVault{LockedToken.Balance}>(
+            self.moxyTokenLockedMVBalancePath,
+            target: self.moxyTokenLockedMVVaultStorage
+        )
+
+        self.account.link<&{LockedToken.Receiver}>(
+            self.moxyTokenLockedMVReceiverPath,
+            target: self.moxyTokenLockedMVVaultStorage
+        )
+
+        // Create Play & Earn resource
+        let playAndEarnvault <- self.createEmptyVault()
+        self.account.save(<-playAndEarnvault, to: self.moxyTokenPlayAndEarnVaultStorage)
+
+        self.account.link<&FungibleToken.Vault>(
+            self.moxyTokenPlayAndEarnVaultPrivate,
+            target: self.moxyTokenPlayAndEarnVaultStorage
+        )
+        self.account.link<&FungibleToken.Vault{FungibleToken.Balance}>(
+            self.moxyTokenPlayAndEarnBalancePath,
+            target: self.moxyTokenPlayAndEarnVaultStorage
+        )
+
+
+        // Create admin resource
         let admin <- create Administrator()
         self.account.save(<-admin, to: self.moxyTokenAdminStorage)
 

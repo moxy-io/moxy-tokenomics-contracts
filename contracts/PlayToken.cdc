@@ -1,11 +1,12 @@
 import FungibleToken from "./flow/FungibleToken.cdc"
-// import FungibleToken from 0xee82856bf20e2aa6
+import MoxyData from "./MoxyData.cdc"
 
 pub contract PlayToken: FungibleToken {
 
     /// Total supply of ExampleTokens in existence
     pub var totalSupply: UFix64
-    access(contract) var totalSupplies24: {UFix64:UFix64}
+    access(contract) var totalSupplies: @MoxyData.OrderedDictionary
+//    access(contract) var totalSupplies24: {UFix64:UFix64}
 
     /// TokensInitialized
     ///
@@ -58,24 +59,23 @@ pub contract PlayToken: FungibleToken {
 
         /// The total balance of this vault
         pub var balance: UFix64
-        access(contract) var dailyBalances: {UFix64:UFix64}
+        access(contract) var dailyBalances: @MoxyData.OrderedDictionary
+//        access(contract) var dailyBalances: {UFix64:UFix64}
 
         // initialize the balance at resource creation time
         init(balance: UFix64) {
             self.balance = balance
-            self.dailyBalances = {}
+            self.dailyBalances <- MoxyData.createNewOrderedDictionary()
         }
 
         pub fun getDailyBalances(): {UFix64: UFix64} {
-            return self.dailyBalances
+            return self.dailyBalances.getDictionary()
         }
 
         pub fun getDailyBalanceFor(timestamp: UFix64): UFix64? {
-            var value = self.dailyBalances[timestamp]
-            if (value == nil) {
-                value = 0.0
-            }
-            return value
+            // Returns the balance for the requested day or zero
+            // if no records at that day.
+            return self.dailyBalances.getValueFor(timestamp: timestamp)
         }
 
         /// withdraw
@@ -105,11 +105,7 @@ pub contract PlayToken: FungibleToken {
         pub fun deposit(from: @FungibleToken.Vault) {
             let vault <- from as! @PlayToken.Vault
             
-            let time0000 = PlayToken.getTimestampTo0000(timestamp: getCurrentBlock().timestamp)
-            if (self.dailyBalances[time0000] == nil) {
-                self.dailyBalances[time0000] = self.balance
-            }
-            self.dailyBalances[time0000] = self.dailyBalances[time0000]! + vault.balance
+            self.dailyBalances.setAmountFor(timestamp: getCurrentBlock().timestamp, amount: vault.balance)
 
             self.balance = self.balance + vault.balance
 
@@ -120,12 +116,7 @@ pub contract PlayToken: FungibleToken {
 
         destroy() {
             // Updating total supply registered daily
-            let time0000 = PlayToken.getTimestampTo0000(timestamp: getCurrentBlock().timestamp)
-            if (PlayToken.totalSupplies24[time0000] == nil) {
-                PlayToken.totalSupplies24[time0000] = PlayToken.totalSupply
-            }
-            PlayToken.totalSupplies24[time0000] = PlayToken.totalSupplies24[time0000]! - self.balance
-
+            PlayToken.destroyTotalSupply(orderedDictionary: <-self.dailyBalances)
             PlayToken.totalSupply = PlayToken.totalSupply - self.balance
         }
     }
@@ -181,15 +172,13 @@ pub contract PlayToken: FungibleToken {
                 amount > 0.0: "Amount minted must be greater than zero"
                 amount <= self.allowedAmount: "Amount minted must be less than the allowed amount"
             }
-            // Updating total supply registered daily
-            let time0000 = PlayToken.getTimestampTo0000(timestamp: getCurrentBlock().timestamp)
-            if (PlayToken.totalSupplies24[time0000] == nil) {
-                PlayToken.totalSupplies24[time0000] = PlayToken.totalSupply
-            }
-            PlayToken.totalSupplies24[time0000] = PlayToken.totalSupplies24[time0000]! + amount
+
+            PlayToken.totalSupplies.setAmountFor(timestamp: getCurrentBlock().timestamp, amount: amount)
 
             PlayToken.totalSupply = PlayToken.totalSupply + amount
+
             self.allowedAmount = self.allowedAmount - amount
+
             emit TokensMinted(amount: amount)
             return <-create Vault(balance: amount)
         }
@@ -226,12 +215,11 @@ pub contract PlayToken: FungibleToken {
     }
 
     pub fun getTotalSupplyFor(timestamp: UFix64): UFix64 {
-        let time0000 = self.getTimestampTo0000(timestamp: timestamp)
-        
-        if (PlayToken.totalSupplies24[time0000] == nil) {
-            PlayToken.totalSupplies24[time0000] = PlayToken.totalSupply
-        }
-        return PlayToken.totalSupplies24[time0000]!
+        return self.totalSupplies.getValueOrMostRecentFor(timestamp: timestamp)
+    }
+
+    pub fun destroyTotalSupply(orderedDictionary: @MoxyData.OrderedDictionary) {
+        self.totalSupplies.destroyWith(orderedDictionary: <-orderedDictionary)
     }
 
     pub resource interface DailyBalancesInterface {
@@ -248,8 +236,9 @@ pub contract PlayToken: FungibleToken {
     init() {
         // Initial total supply defined for PLAY token to starting strength
         // of Proof of Play
-        self.totalSupply = 300000000.0
-        self.totalSupplies24 = {}
+        self.totalSupply = 350000000.0
+        self.totalSupplies <- MoxyData.createNewOrderedDictionary()
+        self.totalSupplies.setAmountFor(timestamp: getCurrentBlock().timestamp, amount: self.totalSupply)
 
         self.playTokenVaultStorage = /storage/playTokenVault
         self.playTokenAdminStorage = /storage/playTokenAdmin

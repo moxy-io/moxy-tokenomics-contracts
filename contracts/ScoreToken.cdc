@@ -1,13 +1,13 @@
 import FungibleToken from "./flow/FungibleToken.cdc"
-
-// import FungibleToken from 0xee82856bf20e2aa6
+import MoxyData from "./MoxyData.cdc"
 
 pub contract ScoreToken: FungibleToken {
 
     /// Total supply of ExampleTokens in existence
     pub var totalSupply: UFix64
-    access(contract) var totalSupplies: {UFix64:UFix64}
-    access(contract) var totalSupplyTimestampMap: [UFix64]
+    access(contract) var totalSupplies: @MoxyData.OrderedDictionary
+//    access(contract) var totalSupplies: {UFix64:UFix64}
+//    access(contract) var totalSupplyTimestampMap: [UFix64]
 
     /// TokensInitialized
     ///
@@ -60,109 +60,42 @@ pub contract ScoreToken: FungibleToken {
 
         /// The total balance of this vault
         pub var balance: UFix64
-        access(contract) var dailyBalances: {UFix64:UFix64}
-        access(contract) var timestampMap: [UFix64]
+        access(contract) var dailyBalances: @MoxyData.OrderedDictionary
+//        access(contract) var dailyBalances: {UFix64:UFix64}
+//        access(contract) var timestampMap: [UFix64]
 
         // initialize the balance at resource creation time
         init(balance: UFix64) {
             self.balance = balance
-            self.dailyBalances = {}
-            self.timestampMap = []
+            self.dailyBalances <- MoxyData.createNewOrderedDictionary()
         }
 
         pub fun getDailyBalances(): {UFix64: UFix64} {
-            return self.dailyBalances
+            return self.dailyBalances.getDictionary()
         }
 
         pub fun getDailyBalanceFor(timestamp: UFix64): UFix64? {
-            let time0000 = ScoreToken.getTimestampTo0000(timestamp: timestamp)
-            if (self.dailyBalances[time0000] == nil) {
-                // For this day there are no registered balances, look for the
-                // last recorded balance or zero if there are no previous records
-                // per requested day
-                var index = -1
-                var hasActivity = false
-                for time in self.timestampMap {
-                    if (time >= time0000  ) {
-                        hasActivity = true
-                        break
-                    }
-                    index = index + 1
-                }
-                if (index < 0) {
-                    // No previous activity
-                    return 0.0
-                }
-                return self.dailyBalances[self.timestampMap[index]]
-            }
-            return self.dailyBalances[time0000]
+            return self.dailyBalances.getValueOrMostRecentFor(timestamp: timestamp)
         }
 
-        pub fun getDailyBalanceForToday(): UFix64? {
-            return self.getDailyBalanceFor(timestamp: getCurrentBlock().timestamp)
+        pub fun getDailyBalanceForToday(): UFix64 {
+            return self.dailyBalances.getValueForToday()
+        }
+
+        pub fun getDailyBalanceChangeForToday(): UFix64 {
+            return self.dailyBalances.getValueChangeForToday()
         }
 
         pub fun getDailyBalanceChange(timestamp: UFix64): UFix64 {
-            let time0000 = ScoreToken.getTimestampTo0000(timestamp: timestamp)
-
-            if (self.timestampMap.length < 1) {
-                // No records > no change
-                return 0.0
-            }
-            if (self.timestampMap[0] > time0000 ) {
-                // Date is previous to the first registered
-                return 0.0
-            }
-            var lastTimestamp = self.getLastTimestampAdded()
-            if (time0000 > lastTimestamp!) {
-                // Date is over last timestamp
-                return 0.0
-            }
-
-            // Balance en la fecha consultada
-            var scoreTimestamp = self.dailyBalances[time0000]
-            
-            if (scoreTimestamp == nil) {
-                // No records > no changes
-                return 0.0
-            }
-
-            // Look for last balance
-            if (self.timestampMap[0] == time0000 ) {
-                // No previous > change is balance total
-                return scoreTimestamp!
-            }
-
-            // There is a balance, we have to look for the previous balance to see
-            // what was the change
-            var index = 0
-            for time in self.timestampMap {
-                if (time == time0000) {
-                    break
-                }
-                index = index + 1
-            }
-            let indexBefore = index - 1
-            var scoreBefore = self.dailyBalances[self.timestampMap[indexBefore]]
-
-            return scoreTimestamp! - scoreBefore!
+            return self.dailyBalances.getValueChange(timestamp: timestamp)
         }
 
         pub fun getLastTimestampAdded(): UFix64? {
-            let pos = self.timestampMap.length - 1
-            if (pos < 0) {
-                return nil
-            }
-            return self.timestampMap[pos]
+            return self.dailyBalances.getLastKeyAdded()
         }
 
         pub fun getFirstTimestampAdded(): UFix64? {
-            return self.timestampMap[0]
-        }
-
-        pub fun getTimestampToStart(timestamp: UFix64): UFix64 {
-            let days = timestamp / 86400.0
-            return UFix64(UInt64(days)) * 86400.0
+            return self.dailyBalances.getFirstKeyAdded()
         }
 
         /// withdraw
@@ -196,13 +129,9 @@ pub contract ScoreToken: FungibleToken {
         
         pub fun depositFor(from: @FungibleToken.Vault, timestamp: UFix64) {
             let vault <- from as! @ScoreToken.Vault
-            let time0000 = ScoreToken.getTimestampTo0000(timestamp: timestamp)
-            let lastTimestamp = self.getLastTimestampAdded()
-            if (lastTimestamp == nil || time0000 > lastTimestamp!) {
-                self.dailyBalances[time0000] = self.balance
-                self.timestampMap.append(time0000)
-            }
-            self.dailyBalances[time0000] = self.dailyBalances[time0000]! + vault.balance           
+
+            self.dailyBalances.setAmountFor(timestamp: timestamp, amount: vault.balance)
+
             self.balance = self.balance + vault.balance
 
             emit TokensDeposited(amount: vault.balance, to: self.owner?.address)
@@ -212,6 +141,7 @@ pub contract ScoreToken: FungibleToken {
         }
 
         destroy() {
+            ScoreToken.destroyTotalSupply(orderedDictionary: <-self.dailyBalances)
             ScoreToken.totalSupply = ScoreToken.totalSupply - self.balance
         }
     }
@@ -263,28 +193,21 @@ pub contract ScoreToken: FungibleToken {
         /// and returns them to the calling context.
         ///
         pub fun mintTokens(amount: UFix64): @ScoreToken.Vault {
-            let timestamp = getCurrentBlock().timestamp
-            return <-self.mintTokensFor(amount: amount, timestamp: timestamp)
+            return <-self.mintTokensFor(amount: amount, timestamp: getCurrentBlock().timestamp)
         }
 
-        pub fun mintTokensFor(amount: UFix64, timestamp: UFix64): @ScoreToken.Vault {
+        access(contract) fun mintTokensFor(amount: UFix64, timestamp: UFix64): @ScoreToken.Vault {
             pre {
                 amount > 0.0: "Amount minted must be greater than zero"
                 amount <= self.allowedAmount: "Amount minted must be less than the allowed amount"
             }
-            let time0000 = ScoreToken.getTimestampTo0000(timestamp: timestamp)
-            let lastTimestamp = ScoreToken.getLastTotalSupplyTimestampAdded()
 
-            if (lastTimestamp != nil && time0000 < lastTimestamp!) {
+            if (!ScoreToken.totalSupplies.canUpdateTo(timestamp: timestamp)) {
                 panic("Cannot mint SCORE token for events before the last registerd")
             } 
 
-            if (lastTimestamp == nil || time0000 > lastTimestamp!) {
-                ScoreToken.totalSupplyTimestampMap.append(time0000)
-                ScoreToken.totalSupplies[time0000] = ScoreToken.totalSupply
-            }
+            ScoreToken.totalSupplies.setAmountFor(timestamp: timestamp, amount: amount)
 
-            ScoreToken.totalSupplies[time0000] = ScoreToken.totalSupplies[time0000]! + amount
             ScoreToken.totalSupply = ScoreToken.totalSupply + amount
 
             self.allowedAmount = self.allowedAmount - amount
@@ -319,97 +242,39 @@ pub contract ScoreToken: FungibleToken {
         }
     }
 
-    pub fun getTimestampTo0000(timestamp: UFix64): UFix64 {
+/*     pub fun getTimestampTo0000(timestamp: UFix64): UFix64 {
         let days = timestamp / 86400.0
         return UFix64(UInt64(days)) * 86400.0
     }
-
+*/
     pub fun getLastTotalSupplyTimestampAdded(): UFix64? {
-        let pos = self.totalSupplyTimestampMap.length - 1
-        if (pos < 0) {
-            return nil
-        }
-        return self.totalSupplyTimestampMap[pos]
+        return self.totalSupplies.getLastKeyAdded()
     }
 
 
     pub fun getTotalSupplyFor(timestamp: UFix64): UFix64 {
-        let time0000 = self.getTimestampTo0000(timestamp: timestamp)
-
-       // If the index exists, we return it     
-        if (ScoreToken.totalSupplies[time0000] != nil) {
-            return ScoreToken.totalSupplies[time0000]!
-        }
-
-        // Check if there is any recorded score
-        if (ScoreToken.totalSupplyTimestampMap.length < 1) {
-            // No hay score registrado aun
-            return ScoreToken.totalSupply
-        }
-
-       // Check if there is any recorded score
-        if (ScoreToken.totalSupplyTimestampMap.length < 2) {
-            // There is only one record
-            if (ScoreToken.totalSupplyTimestampMap[0] > time0000 ) {
-                // Returns zero because we are requesting something prior to the first registered
-                return 0.0
-            }
-            return ScoreToken.totalSupplies[ScoreToken.totalSupplyTimestampMap[0]]!
-        }
-
-        // Check the first score before the searched time0000
-        var i = 0
-        for time in ScoreToken.totalSupplyTimestampMap {
-            if (time > time0000) {
-                break
-            }
-            i = i + 1
-        }
-        i = i - 1
-        return ScoreToken.totalSupplies[ScoreToken.totalSupplyTimestampMap[i]]!
+        return self.totalSupplies.getValueOrMostRecentFor(timestamp: timestamp)
     }
 
     pub fun getDailyChangeTo(timestamp: UFix64): UFix64 {
-        let time0000 = self.getTimestampTo0000(timestamp: timestamp)
-        
-        var lastTimestamp = self.getLastTotalSupplyTimestampAdded()
-        var hasActivity = false
-        var i = -1
-        for time in ScoreToken.totalSupplyTimestampMap {
-            if (time == time0000) {
-                hasActivity = true
-                break
-            }
-            i = i + 1
-        }
-
-        if (!hasActivity) {
-            // No activity found, this may be because the timestamp
-            // is at a time previous than the first record 
-            // or it is in the future, in which case the total supply is returned
-            if (lastTimestamp != nil && lastTimestamp! < time0000) {
-               return ScoreToken.totalSupply 
-            }
-            return 0.0
-        }
-
-        if (ScoreToken.totalSupplyTimestampMap.length < 1 || i < 0) {
-            return ScoreToken.totalSupplies[time0000]!
-        }
-
-        let prevValue = ScoreToken.totalSupplyTimestampMap[i]
-
-        let scoreTimestamp = ScoreToken.totalSupplies[time0000]!
-        let scoreYesterday = ScoreToken.totalSupplies[prevValue]!
-        
-        return scoreTimestamp - scoreYesterday
+        return self.totalSupplies.getValueChange(timestamp: timestamp)
     }
+
+    pub fun getTotalSupplies(): {UFix64: UFix64} {
+        return self.totalSupplies.getDictionary()
+    }
+
+    pub fun destroyTotalSupply(orderedDictionary: @MoxyData.OrderedDictionary) {
+        self.totalSupplies.destroyWith(orderedDictionary: <-orderedDictionary)
+    }
+
 
     pub resource interface DailyBalancesInterface {
         pub fun getDailyBalances(): {UFix64: UFix64}
         pub fun getDailyBalanceFor(timestamp: UFix64): UFix64? 
-        pub fun getDailyBalanceForToday(): UFix64?
+        pub fun getDailyBalanceForToday(): UFix64
         pub fun getDailyBalanceChange(timestamp: UFix64): UFix64
+        pub fun getDailyBalanceChangeForToday(): UFix64
         pub fun getLastTimestampAdded(): UFix64?
         pub fun getFirstTimestampAdded(): UFix64?
     }
@@ -427,8 +292,7 @@ pub contract ScoreToken: FungibleToken {
 
     init() {
         self.totalSupply = 0.0
-        self.totalSupplies = {}
-        self.totalSupplyTimestampMap = []
+        self.totalSupplies <- MoxyData.createNewOrderedDictionary()
 
         self.scoreTokenVaultStorage = /storage/scoreTokenVault
         self.scoreTokenAdminStorage = /storage/scoreTokenAdmin
